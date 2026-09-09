@@ -47,6 +47,7 @@ import { Route as EventsJoinRouteImport } from './routes/events/join'
 import { Route as EventsCreateRouteImport } from './routes/events/create'
 import { Route as EventsEventIdRouteImport } from './routes/events/$eventId'
 import { Route as ChatsChatIdRouteImport } from './routes/chats.$chatId'
+import { Route as ApiHealthRouteImport } from './routes/api/health'
 import { Route as EventsWaitlistEventIdRouteImport } from './routes/events/waitlist.$eventId'
 import { Route as EventsManageEventIdRouteImport } from './routes/events/manage.$eventId'
 import { Route as EventsJoinCodeRouteImport } from './routes/events/join.$code'
@@ -242,6 +243,11 @@ const ChatsChatIdRoute = ChatsChatIdRouteImport.update({
   path: '/$chatId',
   getParentRoute: () => ChatsRoute,
 } as any)
+const ApiHealthRoute = ApiHealthRouteImport.update({
+  id: '/api/health',
+  path: '/api/health',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const EventsWaitlistEventIdRoute = EventsWaitlistEventIdRouteImport.update({
   id: '/events/waitlist/$eventId',
   path: '/events/waitlist/$eventId',
@@ -278,6 +284,7 @@ export interface FileRoutesByFullPath {
   '/signup': typeof SignupRouteWithChildren
   '/terms': typeof TermsRoute
   '/top-picks': typeof TopPicksRoute
+  '/api/health': typeof ApiHealthRoute
   '/chats/$chatId': typeof ChatsChatIdRoute
   '/events/$eventId': typeof EventsEventIdRoute
   '/events/create': typeof EventsCreateRoute
@@ -320,6 +327,7 @@ export interface FileRoutesByTo {
   '/safety': typeof SafetyRoute
   '/terms': typeof TermsRoute
   '/top-picks': typeof TopPicksRoute
+  '/api/health': typeof ApiHealthRoute
   '/chats/$chatId': typeof ChatsChatIdRoute
   '/events/$eventId': typeof EventsEventIdRoute
   '/events/create': typeof EventsCreateRoute
@@ -365,6 +373,7 @@ export interface FileRoutesById {
   '/signup': typeof SignupRouteWithChildren
   '/terms': typeof TermsRoute
   '/top-picks': typeof TopPicksRoute
+  '/api/health': typeof ApiHealthRoute
   '/chats/$chatId': typeof ChatsChatIdRoute
   '/events/$eventId': typeof EventsEventIdRoute
   '/events/create': typeof EventsCreateRoute
@@ -411,6 +420,7 @@ export interface FileRouteTypes {
     | '/signup'
     | '/terms'
     | '/top-picks'
+    | '/api/health'
     | '/chats/$chatId'
     | '/events/$eventId'
     | '/events/create'
@@ -453,6 +463,7 @@ export interface FileRouteTypes {
     | '/safety'
     | '/terms'
     | '/top-picks'
+    | '/api/health'
     | '/chats/$chatId'
     | '/events/$eventId'
     | '/events/create'
@@ -497,6 +508,7 @@ export interface FileRouteTypes {
     | '/signup'
     | '/terms'
     | '/top-picks'
+    | '/api/health'
     | '/chats/$chatId'
     | '/events/$eventId'
     | '/events/create'
@@ -542,6 +554,7 @@ export interface RootRouteChildren {
   SignupRoute: typeof SignupRouteWithChildren
   TermsRoute: typeof TermsRoute
   TopPicksRoute: typeof TopPicksRoute
+  ApiHealthRoute: typeof ApiHealthRoute
   EventsEventIdRoute: typeof EventsEventIdRoute
   EventsCreateRoute: typeof EventsCreateRoute
   EventsJoinRoute: typeof EventsJoinRouteWithChildren
@@ -835,6 +848,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatsChatIdRouteImport
       parentRoute: typeof ChatsRoute
     }
+    '/api/health': {
+      id: '/api/health'
+      path: '/api/health'
+      fullPath: '/api/health'
+      preLoaderRoute: typeof ApiHealthRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/events/waitlist/$eventId': {
       id: '/events/waitlist/$eventId'
       path: '/events/waitlist/$eventId'
@@ -918,6 +938,7 @@ const rootRouteChildren: RootRouteChildren = {
   SignupRoute: SignupRouteWithChildren,
   TermsRoute: TermsRoute,
   TopPicksRoute: TopPicksRoute,
+  ApiHealthRoute: ApiHealthRoute,
   EventsEventIdRoute: EventsEventIdRoute,
   EventsCreateRoute: EventsCreateRoute,
   EventsJoinRoute: EventsJoinRouteWithChildren,
