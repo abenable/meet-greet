@@ -7,8 +7,6 @@ import { getMyProfile, updateProfile } from '#/server/profiles'
 import { disableMyAccount } from '#/server/auth'
 import { getUserBadges, getUserStreak } from '#/server/badges'
 import { activateBoost, getBoostStatus } from '#/server/boosts'
-import { getAdStatus } from '#/server/ads'
-import { RewardedAdButton } from '#/components/RewardedAdButton'
 import AvatarImage from '#/components/AvatarImage'
 import { uploadImageToR2, maybeDeleteR2Image } from '#/lib/upload'
 
@@ -39,10 +37,8 @@ function ProfilePage() {
   const [showDeleteModal, setShowDeleteModal] = useState(false)
 
   const { data: boostStatus } = useQuery({ queryKey: ['boost-status'], queryFn: () => getBoostStatus() })
-  const { data: adStatus } = useQuery({ queryKey: ['ad-status'], queryFn: () => getAdStatus() })
   const [boostCountdown, setBoostCountdown] = useState('')
   const [cooldownCountdown, setCooldownCountdown] = useState('')
-  const [adRewardMessage, setAdRewardMessage] = useState('')
 
   useEffect(() => {
     const tick = () => {
@@ -270,22 +266,6 @@ function ProfilePage() {
           </button>
         )}
 
-        {adStatus?.showAds && !boostStatus?.isBoosted && (
-          <div className="mt-2">
-            <RewardedAdButton
-              type="rewarded_boost"
-              onReward={(reward) => {
-                setAdRewardMessage(`Boost activated! ${reward}`)
-                setTimeout(() => setAdRewardMessage(''), 3000)
-              }}
-            >
-              Watch ad for free boost
-            </RewardedAdButton>
-            {adRewardMessage && (
-              <p className="mt-1 text-xs text-[var(--mag-success)]">{adRewardMessage}</p>
-            )}
-          </div>
-        )}
       </div>
 
       {/* Interests */}
@@ -377,24 +357,16 @@ function ProfilePage() {
       </button>
 
       {/* Action buttons */}
-      <div className="mb-4 grid grid-cols-2 gap-3">
+      <div className="mb-4">
         <button
           onClick={() => {
             const link = `${window.location.origin}/events/join/${profile.userId}`
             navigator.clipboard.writeText(link)
           }}
-          className="inline-flex items-center justify-center gap-2 rounded-full border border-[var(--mag-line)] bg-[var(--mag-card)] px-4 py-3 text-sm font-medium text-[var(--mag-ink)] transition hover:bg-[var(--mag-surface)]"
+          className="inline-flex w-full items-center justify-center gap-2 rounded-full border border-[var(--mag-line)] bg-[var(--mag-card)] px-4 py-3 text-sm font-medium text-[var(--mag-ink)] transition hover:bg-[var(--mag-surface)]"
         >
           <Link2 className="h-4 w-4" />
           Share Profile
-        </button>
-
-        <button
-          onClick={() => navigate({ to: '/pricing' })}
-          className="inline-flex items-center justify-center gap-2 rounded-full bg-[var(--mag-ink)] px-4 py-3 text-sm font-medium text-[var(--mag-bg)] transition hover:opacity-80"
-        >
-          <Zap className="h-4 w-4" />
-          Upgrade
         </button>
       </div>
 

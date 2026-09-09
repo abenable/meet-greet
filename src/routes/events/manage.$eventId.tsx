@@ -42,7 +42,6 @@ import {
 } from '#/server/events'
 import { updateEventSponsor, removeEventSponsor } from '#/server/sponsors'
 import { getSession } from '#/server/auth'
-import { getEffectiveTier } from '#/lib/tiers'
 import AvatarImage from '#/components/AvatarImage'
 import { VerifiedBadge } from '#/components/VerifiedBadge'
 import { uploadImageToR2, maybeDeleteR2Image } from '#/lib/upload'
@@ -181,13 +180,6 @@ function ManageEventPage() {
   }, [event])
 
   const isCreator = !!session?.user?.id && (event as any)?.createdById === session.user.id
-
-  const isHostOrAdmin = (() => {
-    if (!session?.user) return false
-    if (session.user.role === 'admin') return true
-    const tier = getEffectiveTier(session.user.subscriptionTier, session.user.subscriptionExpiresAt)
-    return tier === 'host'
-  })()
 
   const updateMutation = useMutation({
     mutationFn: updateEvent,
@@ -696,13 +688,13 @@ function ManageEventPage() {
       </section>
 
       {/* Sponsor Branding */}
-      {isCreator && isHostOrAdmin && (
+      {isCreator && (
         <section className="mb-6 rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)] p-3">
           <h2 className="mb-3 text-sm font-bold text-[var(--mag-ink)]">Sponsor Branding</h2>
 
           {!(event as any)?.sponsorName && !(event as any)?.sponsorLogo && !(event as any)?.sponsorFrameUrl ? (
             <p className="mb-3 text-xs text-[var(--mag-ink-muted)]">
-              Add sponsor branding (Host tier)
+              Add sponsor branding
             </p>
           ) : (
             <div className="mb-3 flex items-center gap-3">

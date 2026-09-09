@@ -6,8 +6,6 @@ import { requireSession } from '#/server/auth'
 import { broadcastToEvent } from '#/server/websocket-broadcast'
 import { r2Client, R2_BUCKET_NAME, R2_PUBLIC_URL } from '#/lib/r2'
 import { awardBadgeIfNotExists } from './badges.server'
-import { canCreateEvent, canJoinEvent } from '#/server/subscriptions'
-import { getEffectiveTier } from '#/lib/tiers'
 import type { Profile } from '@prisma/client'
 
 function generateCode(): string {
@@ -228,26 +226,10 @@ export const createEvent = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const session = await requireSession()
 
-    const createCheck = await canCreateEvent()
-    if (!createCheck.allowed) {
-      return { success: false, message: createCheck.error }
-    }
-
     if (!data.force) {
       const currentEvent = await getCurrentActiveEvent(session.user.id)
       if (currentEvent) {
         return { success: false, needsConfirm: true as const, currentEvent }
-      }
-    }
-
-    if (data.sponsorName || data.sponsorLogo || data.sponsorFrameUrl) {
-      const user = await prisma.user.findUnique({
-        where: { id: session.user.id },
-        select: { role: true, subscriptionTier: true, subscriptionExpiresAt: true },
-      })
-      const tier = getEffectiveTier(user?.subscriptionTier, user?.subscriptionExpiresAt)
-      if (user?.role !== 'admin' && tier !== 'host') {
-        return { success: false, message: 'Host tier required for sponsor branding' }
       }
     }
 
@@ -360,11 +342,6 @@ export const joinEvent = createServerFn({ method: 'POST' })
 
     if (existing && existing.leftAt === null) {
       return { success: true, alreadyJoined: true }
-    }
-
-    const joinCheck = await canJoinEvent({ data: event.id })
-    if (!joinCheck.allowed) {
-      return { success: false, message: joinCheck.error }
     }
 
     // If event hasn't started yet, add to waitlist
@@ -486,22 +463,6 @@ export const updateEvent = createServerFn({ method: 'POST' })
       throw new Error('Unauthorized')
     }
 
-    const hasSponsorChange =
-      data.data.sponsorName !== undefined ||
-      data.data.sponsorLogo !== undefined ||
-      data.data.sponsorFrameUrl !== undefined
-
-    if (hasSponsorChange) {
-      const user = await prisma.user.findUnique({
-        where: { id: session.user.id },
-        select: { role: true, subscriptionTier: true, subscriptionExpiresAt: true },
-      })
-      const tier = getEffectiveTier(user?.subscriptionTier, user?.subscriptionExpiresAt)
-      if (user?.role !== 'admin' && tier !== 'host') {
-        throw new Error('Host tier required for sponsor branding')
-      }
-    }
-
     return prisma.event.update({
       where: { id: data.eventId },
       data: {
@@ -569,6 +530,173 @@ export const getMyActiveEvent = createServerFn({ method: 'GET' })
     return attendee?.event ?? null
   })
 
+async function buildSwipeDeck({
+  myUserId,
+  candidateUserIds,
+  swipeHistoryEventId,
+  intent,
+}: {
+  myUserId: string
+  candidateUserIds: string[]
+  swipeHistoryEventId: string | null
+  intent?: 'dating' | 'friends' | 'networking'
+}) {
+  const userIds = candidateUserIds.filter((id) => id !== myUserId)
+
+  if (userIds.length === 0) return []
+
+  // Exclude people the current user has already swiped on (passed or liked)
+  const mySwipes = await prisma.eventSwipe.findMany({
+    where: { eventId: swipeHistoryEventId, swiperId: myUserId },
+    select: { swipedId: true, direction: true },
+  })
+  const swipedIds = mySwipes.map((s) => s.swipedId)
+  const visibleUserIds = userIds.filter((id) => !swipedIds.includes(id))
+
+  // Exclude blocked users (bidirectional)
+  const blockedRelations = await prisma.userBlock.findMany({
+    where: {
+      OR: [
+        { blockerId: myUserId, blockedId: { in: visibleUserIds } },
+        { blockerId: { in: visibleUserIds }, blockedId: myUserId },
+      ],
+    },
+    select: { blockerId: true, blockedId: true },
+  })
+  const blockedIds = new Set<string>()
+  for (const b of blockedRelations) {
+    blockedIds.add(b.blockerId === myUserId ? b.blockedId : b.blockerId)
+  }
+  const unblockedUserIds = visibleUserIds.filter((id) => !blockedIds.has(id))
+
+  if (unblockedUserIds.length === 0) return []
+
+  const [profiles, users, myProfile] = await Promise.all([
+    prisma.profile.findMany({
+      where: { userId: { in: unblockedUserIds } },
+      select: {
+        id: true,
+        userId: true,
+        name: true,
+        bio: true,
+        photos: true,
+        gender: true,
+        birthDate: true,
+        location: true,
+        interests: true,
+        lookingFor: true,
+        job: true,
+        verifiedAt: true,
+        boostedUntil: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    }),
+    prisma.user.findMany({
+      where: { id: { in: unblockedUserIds } },
+      select: { id: true, name: true, image: true, email: true, disabledAt: true },
+    }),
+    prisma.profile.findUnique({
+      where: { userId: myUserId },
+      select: { lookingFor: true },
+    }),
+  ])
+
+  const myLookingFor = myProfile?.lookingFor ?? []
+  const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
+
+  // Optional intent filter
+  let intentFilteredUserIds = unblockedUserIds
+  if (intent) {
+    intentFilteredUserIds = unblockedUserIds.filter((id) => {
+      const p = profileByUserId.get(id)
+      return p?.lookingFor?.includes(intent)
+    })
+    if (intentFilteredUserIds.length === 0) return []
+  }
+
+  const userById = new Map(users.map((u) => [u.id, u]))
+
+  // Filter out disabled accounts and shadow-banned users (auto-moderation)
+  const flaggedIds = await getFlaggedUserIds()
+  const activeUserIds = intentFilteredUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
+
+  const now = new Date()
+
+  // Separate boosted and non-boosted profiles
+  const boostedIds = activeUserIds.filter((id) => {
+    const p = profileByUserId.get(id)
+    return p?.boostedUntil ? p.boostedUntil > now : false
+  })
+  const nonBoostedIds = activeUserIds.filter((id) => !boostedIds.includes(id))
+
+  // Shuffle each group separately
+  const shuffledBoosted = seededShuffle(boostedIds, myUserId + '-boosted')
+  const shuffledNonBoosted = seededShuffle(nonBoostedIds, myUserId)
+
+  // Give preference to profiles with overlapping intents within each group
+  const sortByIntentOverlap = (userIds: string[]) => {
+    return userIds.sort((a, b) => {
+      const aProfile = profileByUserId.get(a)
+      const bProfile = profileByUserId.get(b)
+      const aLooking = aProfile?.lookingFor ?? []
+      const bLooking = bProfile?.lookingFor ?? []
+
+      const aOverlap =
+        myLookingFor.length > 0 && aLooking.length > 0
+          ? aLooking.filter((x) => myLookingFor.includes(x)).length
+          : 0
+      const bOverlap =
+        myLookingFor.length > 0 && bLooking.length > 0
+          ? bLooking.filter((x) => myLookingFor.includes(x)).length
+          : 0
+
+      return bOverlap - aOverlap
+    })
+  }
+
+  const sortedBoosted = sortByIntentOverlap(shuffledBoosted)
+  const sortedNonBoosted = sortByIntentOverlap(shuffledNonBoosted)
+  const finalUserIds = [...sortedBoosted, ...sortedNonBoosted]
+
+  return finalUserIds.map((userId) => {
+    const profile = profileByUserId.get(userId)
+    const user = userById.get(userId)
+    const isBoosted = !!profile?.boostedUntil && profile.boostedUntil > now
+    if (profile) {
+      return {
+        ...profile,
+        name: profile.name || user?.name || 'Unnamed',
+        photos:
+          profile.photos && profile.photos.length > 0
+            ? profile.photos
+            : user?.image
+              ? [user.image]
+              : [],
+        isBoosted,
+      }
+    }
+    return {
+      id: user?.id ?? userId,
+      userId,
+      name: user?.name || user?.email?.split('@')[0] || 'Unnamed',
+      bio: '',
+      photos: user?.image ? [user.image] : [],
+      gender: '',
+      birthDate: '',
+      location: '',
+      interests: [],
+      lookingFor: [],
+      job: '',
+      verifiedAt: null,
+      boostedUntil: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      isBoosted: false,
+    }
+  })
+}
+
 export const getEventProfiles = createServerFn({ method: 'GET' })
   .inputValidator(z.object({
     eventId: z.string(),
@@ -584,160 +712,36 @@ export const getEventProfiles = createServerFn({ method: 'GET' })
       where: { eventId, leftAt: null },
       select: { userId: true },
     })
-    const userIds = attendees.map((a) => a.userId).filter((id) => id !== myUserId)
+    const attendeeIds = attendees.map((a) => a.userId).filter((id) => id !== myUserId)
 
-    if (userIds.length === 0) return []
+    if (attendeeIds.length === 0) return []
 
-    // Exclude people the current user has already swiped on (passed or liked)
-    const mySwipes = await prisma.eventSwipe.findMany({
-      where: { eventId, swiperId: myUserId },
-      select: { swipedId: true, direction: true },
+    // Only attendees who've opted into event-scoped discovery show up here —
+    // global-mode attendees are only discoverable in the global pool.
+    const eventModeProfiles = await prisma.profile.findMany({
+      where: { userId: { in: attendeeIds }, discoveryMode: 'event' },
+      select: { userId: true },
     })
-    const swipedIds = mySwipes.map((s) => s.swipedId)
-    const visibleUserIds = userIds.filter((id) => !swipedIds.includes(id))
+    const candidateUserIds = eventModeProfiles.map((p) => p.userId)
 
-    // Exclude blocked users (bidirectional)
-    const blockedRelations = await prisma.userBlock.findMany({
-      where: {
-        OR: [
-          { blockerId: myUserId, blockedId: { in: visibleUserIds } },
-          { blockerId: { in: visibleUserIds }, blockedId: myUserId },
-        ],
-      },
-      select: { blockerId: true, blockedId: true },
+    return buildSwipeDeck({ myUserId, candidateUserIds, swipeHistoryEventId: eventId, intent })
+  })
+
+export const getGlobalProfiles = createServerFn({ method: 'GET' })
+  .inputValidator(z.object({
+    intent: z.enum(['dating', 'friends', 'networking']).optional(),
+  }).optional())
+  .handler(async ({ data }) => {
+    const session = await requireSession()
+    const myUserId = session.user.id
+
+    const globalProfiles = await prisma.profile.findMany({
+      where: { discoveryMode: 'global', userId: { not: myUserId } },
+      select: { userId: true },
     })
-    const blockedIds = new Set<string>()
-    for (const b of blockedRelations) {
-      blockedIds.add(b.blockerId === myUserId ? b.blockedId : b.blockerId)
-    }
-    const unblockedUserIds = visibleUserIds.filter((id) => !blockedIds.has(id))
+    const candidateUserIds = globalProfiles.map((p) => p.userId)
 
-    if (unblockedUserIds.length === 0) return []
-
-    const [profiles, users, myProfile] = await Promise.all([
-      prisma.profile.findMany({
-        where: { userId: { in: unblockedUserIds } },
-        select: {
-          id: true,
-          userId: true,
-          name: true,
-          bio: true,
-          photos: true,
-          gender: true,
-          birthDate: true,
-          location: true,
-          interests: true,
-          lookingFor: true,
-          job: true,
-          verifiedAt: true,
-          boostedUntil: true,
-          createdAt: true,
-          updatedAt: true,
-        },
-      }),
-      prisma.user.findMany({
-        where: { id: { in: unblockedUserIds } },
-        select: { id: true, name: true, image: true, email: true, disabledAt: true },
-      }),
-      prisma.profile.findUnique({
-        where: { userId: myUserId },
-        select: { lookingFor: true },
-      }),
-    ])
-
-    const myLookingFor = myProfile?.lookingFor ?? []
-    const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
-
-    // Optional intent filter
-    let candidateUserIds = unblockedUserIds
-    if (intent) {
-      candidateUserIds = unblockedUserIds.filter((id) => {
-        const p = profileByUserId.get(id)
-        return p?.lookingFor?.includes(intent)
-      })
-      if (candidateUserIds.length === 0) return []
-    }
-
-    const userById = new Map(users.map((u) => [u.id, u]))
-
-    // Filter out disabled accounts and shadow-banned users (auto-moderation)
-    const flaggedIds = await getFlaggedUserIds()
-    const activeUserIds = candidateUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
-
-    const now = new Date()
-
-    // Separate boosted and non-boosted profiles
-    const boostedIds = activeUserIds.filter((id) => {
-      const p = profileByUserId.get(id)
-      return p?.boostedUntil ? p.boostedUntil > now : false
-    })
-    const nonBoostedIds = activeUserIds.filter((id) => !boostedIds.includes(id))
-
-    // Shuffle each group separately
-    const shuffledBoosted = seededShuffle(boostedIds, myUserId + '-boosted')
-    const shuffledNonBoosted = seededShuffle(nonBoostedIds, myUserId)
-
-    // Give preference to profiles with overlapping intents within each group
-    const sortByIntentOverlap = (userIds: string[]) => {
-      return userIds.sort((a, b) => {
-        const aProfile = profileByUserId.get(a)
-        const bProfile = profileByUserId.get(b)
-        const aLooking = aProfile?.lookingFor ?? []
-        const bLooking = bProfile?.lookingFor ?? []
-
-        const aOverlap =
-          myLookingFor.length > 0 && aLooking.length > 0
-            ? aLooking.filter((x) => myLookingFor.includes(x)).length
-            : 0
-        const bOverlap =
-          myLookingFor.length > 0 && bLooking.length > 0
-            ? bLooking.filter((x) => myLookingFor.includes(x)).length
-            : 0
-
-        return bOverlap - aOverlap
-      })
-    }
-
-    const sortedBoosted = sortByIntentOverlap(shuffledBoosted)
-    const sortedNonBoosted = sortByIntentOverlap(shuffledNonBoosted)
-    const finalUserIds = [...sortedBoosted, ...sortedNonBoosted]
-
-    return finalUserIds.map((userId) => {
-      const profile = profileByUserId.get(userId)
-      const user = userById.get(userId)
-      const isBoosted = !!profile?.boostedUntil && profile.boostedUntil > now
-      if (profile) {
-        return {
-          ...profile,
-          name: profile.name || user?.name || 'Unnamed',
-          photos:
-            profile.photos && profile.photos.length > 0
-              ? profile.photos
-              : user?.image
-                ? [user.image]
-                : [],
-          isBoosted,
-        }
-      }
-      return {
-        id: user?.id ?? userId,
-        userId,
-        name: user?.name || user?.email?.split('@')[0] || 'Unnamed',
-        bio: '',
-        photos: user?.image ? [user.image] : [],
-        gender: '',
-        birthDate: '',
-        location: '',
-        interests: [],
-        lookingFor: [],
-        job: '',
-        verifiedAt: null,
-        boostedUntil: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        isBoosted: false,
-      }
-    })
+    return buildSwipeDeck({ myUserId, candidateUserIds, swipeHistoryEventId: null, intent: data?.intent })
   })
 
 export const getEventAttendees = createServerFn({ method: 'GET' })
@@ -808,6 +812,7 @@ export const getEventAttendees = createServerFn({ method: 'GET' })
         verifiedAt: null,
         boostedUntil: null,
         lastBoostedAt: null,
+        discoveryMode: 'global',
         createdAt: new Date(),
         updatedAt: new Date(),
       }
@@ -1020,33 +1025,36 @@ export const removeFromWaitlist = createServerFn({ method: 'POST' })
 
 export const reportUser = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
-    eventId: z.string(),
+    eventId: z.string().optional(),
     reportedId: z.string(),
     reason: z.string().min(1).max(1000),
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
 
-    // Both users should be attending the event
-    const [reporterAttendee, reportedAttendee] = await Promise.all([
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: session.user.id, leftAt: null },
-      }),
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: data.reportedId, leftAt: null },
-      }),
-    ])
+    if (data.eventId) {
+      const eventId = data.eventId
+      // Both users should be attending the event
+      const [reporterAttendee, reportedAttendee] = await Promise.all([
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: session.user.id, leftAt: null },
+        }),
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: data.reportedId, leftAt: null },
+        }),
+      ])
 
-    if (!reporterAttendee) {
-      return { success: false, message: 'You must be attending the event to report someone' }
-    }
-    if (!reportedAttendee) {
-      return { success: false, message: 'Reported user is not attending this event' }
+      if (!reporterAttendee) {
+        return { success: false, message: 'You must be attending the event to report someone' }
+      }
+      if (!reportedAttendee) {
+        return { success: false, message: 'Reported user is not attending this event' }
+      }
     }
 
     await prisma.report.create({
       data: {
-        eventId: data.eventId,
+        eventId: data.eventId ?? null,
         reporterId: session.user.id,
         reportedId: data.reportedId,
         reason: data.reason,

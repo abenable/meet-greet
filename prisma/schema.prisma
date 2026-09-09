@@ -17,8 +17,6 @@ model User {
   disabledAt    DateTime?
   streakCount   Int       @default(0)
   lastActiveDate DateTime?
-  subscriptionTier String @default("free")
-  subscriptionExpiresAt DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
@@ -86,6 +84,7 @@ model Profile {
   verifiedAt  DateTime?
   boostedUntil DateTime?
   lastBoostedAt DateTime?
+  discoveryMode String  @default("global") // 'global' | 'event'
   createdAt   DateTime  @default(now())
   updatedAt   DateTime @updatedAt
 }
@@ -207,8 +206,8 @@ model EventPost {
 
 model EventSwipe {
   id        String   @id @default(uuid())
-  eventId   String
-  event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId   String?
+  event     Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
   swiperId  String
   swipedId  String
   direction String // like | pass | super
@@ -221,8 +220,8 @@ model EventSwipe {
 
 model EventMatch {
   id                 String          @id @default(uuid())
-  eventId            String
-  event              Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId            String?
+  event              Event?          @relation(fields: [eventId], references: [id], onDelete: SetNull)
   user1Id            String
   user2Id            String
   createdAt          DateTime        @default(now())
@@ -291,7 +290,7 @@ model Todo {
 
 model EventMessageRequest {
   id         String   @id @default(uuid())
-  eventId    String
+  eventId    String?
   senderId   String
   receiverId String
   status     String   // pending | accepted | declined
@@ -301,24 +300,3 @@ model EventMessageRequest {
   @@unique([eventId, senderId, receiverId])
 }
 
-model DailySwipeLimit {
-  id        String   @id @default(uuid())
-  userId    String
-  eventId   String
-  date      DateTime @default(now())
-  count     Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([userId, eventId, date])
-}
-
-model AdView {
-  id        String   @id @default(uuid())
-  userId    String
-  type      String   // 'rewarded_boost' | 'rewarded_swipes'
-  reward    String   // what was granted
-  createdAt DateTime @default(now())
-
-  @@index([userId, type, createdAt])
-}

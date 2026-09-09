@@ -6,9 +6,7 @@ import { X, Heart, MapPin, Users, ArrowRight, Flag, MessageCircle, Briefcase, Za
 import { getMyActiveEvent, reportUser } from '#/server/events'
 import { recordSwipe, getSwipeDeck } from '#/server/swipes'
 import { sendMessageRequest } from '#/server/requests'
-import { getAdStatus } from '#/server/ads'
-import { RewardedAdButton } from '#/components/RewardedAdButton'
-import { AdCard } from '#/components/AdCard'
+import { getMyProfile } from '#/server/profiles'
 import AvatarImage from '#/components/AvatarImage'
 import { VerifiedBadge } from '#/components/VerifiedBadge'
 
@@ -31,21 +29,22 @@ function DiscoverPage() {
   const queryClient = useQueryClient()
   const containerRef = useRef<HTMLDivElement>(null)
   const { data: activeEvent } = useQuery({ queryKey: ['active-event'], queryFn: () => getMyActiveEvent() })
-  const eventId = activeEvent?.id ?? ''
-  const isMystery = activeEvent?.mysteryMode === true
+  const { data: myProfile, isLoading: profileLoading } = useQuery({ queryKey: ['my-profile'], queryFn: () => getMyProfile() })
+
+  // Global discovery is the default — event-scoped discovery only kicks in when
+  // the user has explicitly opted into it (Settings > Discovery) and is checked
+  // into an event.
+  const isEventMode = myProfile?.discoveryMode === 'event' && !!activeEvent
+  const effectiveEventId = isEventMode ? activeEvent!.id : undefined
+  const isMystery = isEventMode && activeEvent?.mysteryMode === true
+  const awaitingEventCheckIn = !profileLoading && myProfile?.discoveryMode === 'event' && !activeEvent
 
   const [selectedIntent, setSelectedIntent] = useState<'dating' | 'friends' | 'networking' | ''>('')
-  const [swipeError, setSwipeError] = useState('')
-
-  const { data: adStatus } = useQuery({
-    queryKey: ['ad-status'],
-    queryFn: () => getAdStatus(),
-  })
 
   const { data: baseProfiles = [], isLoading: profilesLoading } = useQuery({
-    queryKey: ['event-profiles', eventId, selectedIntent],
-    queryFn: () => getSwipeDeck({ data: { eventId, intent: selectedIntent || undefined } }),
-    enabled: !!eventId,
+    queryKey: ['swipe-deck', effectiveEventId ?? 'global', selectedIntent],
+    queryFn: () => getSwipeDeck({ data: { eventId: effectiveEventId, intent: selectedIntent || undefined } }),
+    enabled: !profileLoading && !awaitingEventCheckIn,
   })
 
   const [currentIndex, setCurrentIndex] = useState(0)
@@ -53,7 +52,6 @@ function DiscoverPage() {
   const [swipedIds, setSwipedIds] = useState<Set<string>>(new Set())
   const [requestedIds, setRequestedIds] = useState<Set<string>>(new Set())
   const [requestPendingIds, setRequestPendingIds] = useState<Set<string>>(new Set())
-  const [dismissedAdIndices, setDismissedAdIndices] = useState<Set<number>>(new Set())
 
   // Report modal state
   const [reportModalOpen, setReportModalOpen] = useState(false)
@@ -64,15 +62,8 @@ function DiscoverPage() {
   const swipeMutation = useMutation({
     mutationFn: recordSwipe,
     onSuccess: () => {
-      setSwipeError('')
       queryClient.invalidateQueries({ queryKey: ['likes'] })
       queryClient.invalidateQueries({ queryKey: ['matches'] })
-    },
-    onError: (error: any) => {
-      const msg = error?.message || 'Something went wrong'
-      if (msg.includes('Daily swipe limit')) {
-        setSwipeError('Daily swipe limit reached')
-      }
     },
   })
 
@@ -110,11 +101,11 @@ function DiscoverPage() {
 
   const handleAction = useCallback((direction: 'like' | 'pass') => {
     const profile = baseProfiles[currentIndex]
-    if (!profile || !eventId) return
+    if (!profile) return
     if (swipedIds.has(profile.userId)) return
 
     setSwipedIds((prev) => new Set(prev).add(profile.userId))
-    swipeMutation.mutate({ data: { eventId, swipedId: profile.userId, direction } })
+    swipeMutation.mutate({ data: { eventId: effectiveEventId, swipedId: profile.userId, direction } })
 
     const container = containerRef.current
     if (!container) return
@@ -122,23 +113,23 @@ function DiscoverPage() {
     if (next < container.children.length) {
       ;(container.children[next] as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
-  }, [currentIndex, eventId, baseProfiles, swipeMutation, swipedIds])
+  }, [currentIndex, effectiveEventId, baseProfiles, swipeMutation, swipedIds])
 
   const handleRequest = useCallback(() => {
     const profile = baseProfiles[currentIndex]
-    if (!profile || !eventId) return
+    if (!profile) return
     if (requestedIds.has(profile.userId) || requestPendingIds.has(profile.userId)) return
 
     setRequestPendingIds((prev) => new Set(prev).add(profile.userId))
-    requestMutation.mutate({ data: { eventId, receiverId: profile.userId } })
-  }, [currentIndex, eventId, baseProfiles, requestMutation, requestedIds, requestPendingIds])
+    requestMutation.mutate({ data: { eventId: effectiveEventId, receiverId: profile.userId } })
+  }, [currentIndex, effectiveEventId, baseProfiles, requestMutation, requestedIds, requestPendingIds])
 
   const handleReport = () => {
     const profile = baseProfiles[currentIndex]
-    if (!profile || !eventId) return
+    if (!profile) return
     const reason = reportReason === 'Other' ? reportCustom.trim() : reportReason
     if (!reason) return
-    reportMutation.mutate({ data: { eventId, reportedId: profile.userId, reason } })
+    reportMutation.mutate({ data: { eventId: effectiveEventId, reportedId: profile.userId, reason } })
   }
 
   const nextPhoto = (profileId: string, max: number) => {
@@ -148,39 +139,21 @@ function DiscoverPage() {
     setPhotoIndices((prev) => ({ ...prev, [profileId]: Math.max((prev[profileId] ?? 0) - 1, 0) }))
   }
 
-  // Interleave ad cards every 3-5 profiles
-  const items = baseProfiles.flatMap((profile, i) => {
-    if (adStatus?.showAds && i > 0 && i % 4 === 0) {
-      return [{ type: 'ad' as const, index: i }, { type: 'profile' as const, profile }]
-    }
-    return [{ type: 'profile' as const, profile }]
-  })
-
-  const profileIndexMap = items.reduce((acc, item, idx) => {
-    if (item.type === 'profile') {
-      acc[idx] = (acc[idx - 1] ?? -1) + 1
-    } else {
-      acc[idx] = acc[idx - 1] ?? -1
-    }
-    return acc
-  }, {} as Record<number, number>)
-
   const onScroll = useCallback(() => {
     const container = containerRef.current
     if (!container) return
     const idx = Math.round(container.scrollTop / container.clientHeight)
-    const profileIdx = profileIndexMap[idx] ?? -1
-    if (profileIdx >= 0) {
-      setCurrentIndex(Math.min(profileIdx, baseProfiles.length - 1))
-    }
-  }, [baseProfiles.length, profileIndexMap])
+    setCurrentIndex(Math.min(Math.max(idx, 0), baseProfiles.length - 1))
+  }, [baseProfiles.length])
 
-  if (!activeEvent) {
+  if (awaitingEventCheckIn) {
     return (
       <div className="page-wrap flex min-h-[90vh] flex-col items-center justify-center px-4 py-16 text-center">
         <Users className="mb-4 h-16 w-16 text-[var(--mag-ink-muted)]" />
         <h2 className="text-xl font-bold text-[var(--mag-ink)]">Join an Event First</h2>
-        <p className="mt-2 max-w-xs text-sm text-[var(--mag-ink-soft)]">Discover is only available when you are checked into an event.</p>
+        <p className="mt-2 max-w-xs text-sm text-[var(--mag-ink-soft)]">
+          Your discovery is set to event-only in Settings. Check into an event to start swiping, or switch back to the global pool.
+        </p>
         <Link to="/events" className="mt-6 inline-flex items-center gap-2 rounded-full bg-[var(--mag-ink)] px-6 py-3 text-sm font-bold !text-[var(--mag-bg)] no-underline transition hover:opacity-80 active:scale-95">
           Browse Events <ArrowRight className="h-4 w-4" />
         </Link>
@@ -188,7 +161,7 @@ function DiscoverPage() {
     )
   }
 
-  if (profilesLoading) {
+  if (profileLoading || profilesLoading) {
     return (
       <div className="flex h-[calc(100dvh-112px)] flex-col bg-[var(--mag-bg)]">
         <div className="shrink-0 px-4 py-2">
@@ -211,10 +184,12 @@ function DiscoverPage() {
         <Users className="mb-4 h-16 w-16 text-[var(--mag-ink-muted)]" />
         <h2 className="text-xl font-bold text-[var(--mag-ink)]">Nobody Here Yet</h2>
         <p className="mt-2 max-w-xs text-sm text-[var(--mag-ink-soft)]">
-          Other attendees haven't joined, or you've already swiped through everyone in this event.
+          {isEventMode
+            ? "Other attendees haven't joined, or you've already swiped through everyone in this event."
+            : "Nobody new to show right now, or you've already swiped through everyone."}
         </p>
         <Link to="/events" className="mt-6 inline-flex items-center gap-2 rounded-full bg-[var(--mag-ink)] px-6 py-3 text-sm font-bold !text-[var(--mag-bg)] no-underline transition hover:opacity-80 active:scale-95">
-          Browse More Events <ArrowRight className="h-4 w-4" />
+          Browse Events <ArrowRight className="h-4 w-4" />
         </Link>
       </div>
     )
@@ -244,45 +219,13 @@ function DiscoverPage() {
           ))}
         </div>
       </div>
-      {swipeError && adStatus?.showAds && (
-        <div className="shrink-0 px-4 py-2">
-          <div className="rounded-lg bg-amber-50 border border-amber-200 p-3 text-center">
-            <p className="text-sm font-medium text-amber-800">{swipeError}</p>
-            <div className="mt-2">
-              <RewardedAdButton
-                type="rewarded_swipes"
-                eventId={eventId}
-                onReward={() => {
-                  setSwipeError('')
-                  queryClient.invalidateQueries({ queryKey: ['ad-status'] })
-                }}
-              >
-                Watch ad for 5 extra swipes
-              </RewardedAdButton>
-            </div>
-          </div>
-        </div>
-      )}
       <div
         ref={containerRef}
         onScroll={onScroll}
         className="hide-scrollbar flex-1 w-full snap-y snap-mandatory overflow-y-auto"
         style={{ scrollBehavior: 'smooth' }}
       >
-        {items.map((item, index) => {
-          if (item.type === 'ad') {
-            if (dismissedAdIndices.has(index)) return null
-            return (
-              <AdCard
-                key={`ad-${index}`}
-                onClose={() => {
-                  setDismissedAdIndices((prev) => new Set(prev).add(index))
-                }}
-              />
-            )
-          }
-
-          const profile = item.profile
+        {baseProfiles.map((profile, index) => {
           const photoIdx = photoIndices[profile.userId] ?? 0
           const pic = profile.photos[photoIdx] ?? ''
           const hasPhotos = profile.photos.length > 0

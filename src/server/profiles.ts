@@ -49,6 +49,7 @@ export const updateProfile = createServerFn({ method: 'POST' })
     interests: z.array(z.string().max(50)).max(20).optional(),
     job: z.string().max(200).optional(),
     lookingFor: z.array(z.enum(['dating', 'friends', 'networking'])).optional(),
+    discoveryMode: z.enum(['global', 'event']).optional(),
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
@@ -66,6 +67,7 @@ export const updateProfile = createServerFn({ method: 'POST' })
         ...(sanitized.interests !== undefined && { interests: sanitized.interests }),
         ...(sanitized.job !== undefined && { job: sanitized.job }),
         ...(data.lookingFor !== undefined && { lookingFor: data.lookingFor }),
+        ...(data.discoveryMode !== undefined && { discoveryMode: data.discoveryMode }),
       },
       create: {
         userId: session.user.id,
@@ -76,6 +78,7 @@ export const updateProfile = createServerFn({ method: 'POST' })
         location: sanitized.location ?? '',
         interests: sanitized.interests ?? [],
         lookingFor: data.lookingFor ?? [],
+        discoveryMode: data.discoveryMode ?? 'global',
       },
     })
   })

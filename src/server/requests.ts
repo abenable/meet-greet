@@ -6,49 +6,46 @@ import { createNotification } from './notifications.server'
 
 export const sendMessageRequest = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
-    eventId: z.string(),
+    eventId: z.string().optional(),
     receiverId: z.string(),
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
     const senderId = session.user.id
+    const eventId = data.eventId ?? null
 
     if (senderId === data.receiverId) {
       throw new Error('Cannot request yourself')
     }
 
-    // Verify both are active attendees
-    const [senderAttendee, receiverAttendee] = await Promise.all([
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: senderId, leftAt: null },
-      }),
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: data.receiverId, leftAt: null },
-      }),
-    ])
+    if (eventId) {
+      // Verify both are active attendees
+      const [senderAttendee, receiverAttendee] = await Promise.all([
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: senderId, leftAt: null },
+        }),
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: data.receiverId, leftAt: null },
+        }),
+      ])
 
-    if (!senderAttendee || !receiverAttendee) {
-      throw new Error('Both users must be active attendees')
+      if (!senderAttendee || !receiverAttendee) {
+        throw new Error('Both users must be active attendees')
+      }
     }
 
     // Check if already matched
     const [u1, u2] = [senderId, data.receiverId].sort()
     const existingMatch = await prisma.eventMatch.findFirst({
-      where: { eventId: data.eventId, user1Id: u1, user2Id: u2 },
+      where: { eventId, user1Id: u1, user2Id: u2 },
     })
     if (existingMatch) {
       throw new Error('You are already matched')
     }
 
     // Check for existing request in either direction
-    const existing = await prisma.eventMessageRequest.findUnique({
-      where: {
-        eventId_senderId_receiverId: {
-          eventId: data.eventId,
-          senderId,
-          receiverId: data.receiverId,
-        },
-      },
+    const existing = await prisma.eventMessageRequest.findFirst({
+      where: { eventId, senderId, receiverId: data.receiverId },
     })
 
     if (existing) {
@@ -69,7 +66,7 @@ export const sendMessageRequest = createServerFn({ method: 'POST' })
 
     const request = await prisma.eventMessageRequest.create({
       data: {
-        eventId: data.eventId,
+        eventId,
         senderId,
         receiverId: data.receiverId,
         status: 'pending',
@@ -100,7 +97,7 @@ export const acceptMessageRequest = createServerFn({ method: 'POST' })
     // Create match
     const [u1, u2] = [request.senderId, request.receiverId].sort()
     const existingMatch = await prisma.eventMatch.findFirst({
-      where: { eventId: request.eventId, user1Id: u1, user2Id: u2 },
+      where: { eventId: request.eventId ?? null, user1Id: u1, user2Id: u2 },
     })
 
     if (!existingMatch) {
@@ -162,7 +159,7 @@ export const getIncomingMessageRequests = createServerFn({ method: 'GET' })
     if (requests.length === 0) return []
 
     const senderIds = requests.map((r) => r.senderId)
-    const eventIds = [...new Set(requests.map((r) => r.eventId))]
+    const eventIds = [...new Set(requests.map((r) => r.eventId).filter((id): id is string => !!id))]
 
     const [profiles, users, events] = await Promise.all([
       prisma.profile.findMany({ where: { userId: { in: senderIds } } }),
@@ -188,7 +185,7 @@ export const getIncomingMessageRequests = createServerFn({ method: 'GET' })
         return {
           id: r.id,
           eventId: r.eventId,
-          eventName: eventById.get(r.eventId)?.name ?? '',
+          eventName: r.eventId ? (eventById.get(r.eventId)?.name ?? '') : '',
           senderId: r.senderId,
           senderName: profile?.name || user?.name || user?.email?.split('@')[0] || 'Unnamed',
           senderPhotos:
@@ -216,7 +213,7 @@ export const getOutgoingMessageRequests = createServerFn({ method: 'GET' })
     if (requests.length === 0) return []
 
     const receiverIds = requests.map((r) => r.receiverId)
-    const eventIds = [...new Set(requests.map((r) => r.eventId))]
+    const eventIds = [...new Set(requests.map((r) => r.eventId).filter((id): id is string => !!id))]
 
     const [profiles, users, events] = await Promise.all([
       prisma.profile.findMany({ where: { userId: { in: receiverIds } } }),
@@ -242,7 +239,7 @@ export const getOutgoingMessageRequests = createServerFn({ method: 'GET' })
         return {
           id: r.id,
           eventId: r.eventId,
-          eventName: eventById.get(r.eventId)?.name ?? '',
+          eventName: r.eventId ? (eventById.get(r.eventId)?.name ?? '') : '',
           receiverId: r.receiverId,
           receiverName: profile?.name || user?.name || user?.email?.split('@')[0] || 'Unnamed',
           receiverPhotos:

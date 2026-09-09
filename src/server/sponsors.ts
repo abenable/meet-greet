@@ -2,7 +2,6 @@ import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { prisma } from '#/db'
 import { requireSession } from '#/server/auth'
-import { getEffectiveTier } from '#/lib/tiers'
 
 export const updateEventSponsor = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
@@ -19,15 +18,6 @@ export const updateEventSponsor = createServerFn({ method: 'POST' })
     })
     if (!event) throw new Error('Event not found')
     if (event.createdById !== session.user.id) throw new Error('Unauthorized')
-
-    const user = await prisma.user.findUnique({
-      where: { id: session.user.id },
-      select: { role: true, subscriptionTier: true, subscriptionExpiresAt: true },
-    })
-    const tier = getEffectiveTier(user?.subscriptionTier, user?.subscriptionExpiresAt)
-    if (user?.role !== 'admin' && tier !== 'host') {
-      throw new Error('Host tier required')
-    }
 
     return prisma.event.update({
       where: { id: data.eventId },
@@ -64,15 +54,6 @@ export const removeEventSponsor = createServerFn({ method: 'POST' })
     })
     if (!event) throw new Error('Event not found')
     if (event.createdById !== session.user.id) throw new Error('Unauthorized')
-
-    const user = await prisma.user.findUnique({
-      where: { id: session.user.id },
-      select: { role: true, subscriptionTier: true, subscriptionExpiresAt: true },
-    })
-    const tier = getEffectiveTier(user?.subscriptionTier, user?.subscriptionExpiresAt)
-    if (user?.role !== 'admin' && tier !== 'host') {
-      throw new Error('Host tier required')
-    }
 
     return prisma.event.update({
       where: { id: eventId },

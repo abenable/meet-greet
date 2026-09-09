@@ -2,30 +2,24 @@ import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { prisma } from '#/db'
 import { requireSession } from '#/server/auth'
-import { TIER_CONFIG, getEffectiveTier } from '#/lib/tiers'
+
+const BOOST_INTERVAL_DAYS = 1
 
 export const activateBoost = createServerFn({ method: 'POST' })
   .handler(async () => {
     const session = await requireSession()
     const now = new Date()
 
-    const [user, profile] = await Promise.all([
-      prisma.user.findUnique({
-        where: { id: session.user.id },
-        select: { subscriptionTier: true, subscriptionExpiresAt: true },
-      }),
-      prisma.profile.findUnique({
-        where: { userId: session.user.id },
-        select: { boostedUntil: true, lastBoostedAt: true },
-      }),
-    ])
+    const profile = await prisma.profile.findUnique({
+      where: { userId: session.user.id },
+      select: { boostedUntil: true, lastBoostedAt: true },
+    })
 
-    if (!user || !profile) {
+    if (!profile) {
       throw new Error('Profile not found')
     }
 
-    const tier = getEffectiveTier(user.subscriptionTier, user.subscriptionExpiresAt)
-    const intervalDays = TIER_CONFIG[tier].boosts.intervalDays
+    const intervalDays = BOOST_INTERVAL_DAYS
 
     if (profile.lastBoostedAt) {
       const msSinceLastBoost = now.getTime() - profile.lastBoostedAt.getTime()
@@ -68,18 +62,12 @@ export const getBoostStatus = createServerFn({ method: 'GET' })
   .handler(async () => {
     const session = await requireSession()
 
-    const [user, profile] = await Promise.all([
-      prisma.user.findUnique({
-        where: { id: session.user.id },
-        select: { subscriptionTier: true, subscriptionExpiresAt: true },
-      }),
-      prisma.profile.findUnique({
-        where: { userId: session.user.id },
-        select: { boostedUntil: true, lastBoostedAt: true },
-      }),
-    ])
+    const profile = await prisma.profile.findUnique({
+      where: { userId: session.user.id },
+      select: { boostedUntil: true, lastBoostedAt: true },
+    })
 
-    if (!user || !profile) {
+    if (!profile) {
       throw new Error('Profile not found')
     }
 
@@ -87,8 +75,7 @@ export const getBoostStatus = createServerFn({ method: 'GET' })
     const isBoosted = profile.boostedUntil ? profile.boostedUntil > now : false
     const boostedUntil = profile.boostedUntil ?? undefined
 
-    const tier = getEffectiveTier(user.subscriptionTier, user.subscriptionExpiresAt)
-    const intervalDays = TIER_CONFIG[tier].boosts.intervalDays
+    const intervalDays = BOOST_INTERVAL_DAYS
 
     let nextBoostAt: Date | undefined
     if (profile.lastBoostedAt) {

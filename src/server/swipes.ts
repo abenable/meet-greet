@@ -8,24 +8,24 @@ import { getClientIdentifier } from '#/lib/rate-limit.server'
 import { sanitizeText } from '#/lib/sanitize'
 import { broadcastMatchCreated } from './websocket-broadcast'
 import { awardBadgeIfNotExists } from './badges.server'
-import { canSwipeToday } from '#/server/subscriptions'
-import { getEventProfiles } from '#/server/events'
+import { getEventProfiles, getGlobalProfiles } from '#/server/events'
 
 const swipeRateLimit = rateLimit({ windowMs: 60 * 1000, maxRequests: 30 })
 
 export const recordSwipe = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
-    eventId: z.string(),
+    eventId: z.string().optional(),
     swipedId: z.string(),
     direction: z.enum(['like', 'pass', 'super']),
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
     const swiperId = session.user.id
+    const eventId = data.eventId ?? null
 
     const identifier = `${getClientIdentifier()}:${swiperId}`
     const rateLimitResult = await swipeRateLimit(identifier)
-    
+
     if (!rateLimitResult.success) {
       throw new Error('Too many swipes. Please slow down.')
     }
@@ -34,33 +34,24 @@ export const recordSwipe = createServerFn({ method: 'POST' })
       throw new Error('Cannot swipe yourself')
     }
 
-    const swipeCheck = await canSwipeToday({ data: data.eventId })
-    if (!swipeCheck.allowed) {
-      throw new Error(swipeCheck.error)
-    }
+    if (eventId) {
+      const [swiperAttendee, swipedAttendee] = await Promise.all([
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: swiperId, leftAt: null },
+        }),
+        prisma.eventAttendee.findFirst({
+          where: { eventId, userId: data.swipedId, leftAt: null },
+        }),
+      ])
 
-    const [swiperAttendee, swipedAttendee] = await Promise.all([
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: swiperId, leftAt: null },
-      }),
-      prisma.eventAttendee.findFirst({
-        where: { eventId: data.eventId, userId: data.swipedId, leftAt: null },
-      }),
-    ])
-
-    if (!swiperAttendee || !swipedAttendee) {
-      throw new Error('Both users must be active attendees of the event')
+      if (!swiperAttendee || !swipedAttendee) {
+        throw new Error('Both users must be active attendees of the event')
+      }
     }
 
     // Check for existing swipe to avoid duplicate side effects
-    const existing = await prisma.eventSwipe.findUnique({
-      where: {
-        eventId_swiperId_swipedId: {
-          eventId: data.eventId,
-          swiperId,
-          swipedId: data.swipedId,
-        },
-      },
+    const existing = await prisma.eventSwipe.findFirst({
+      where: { eventId, swiperId, swipedId: data.swipedId },
     })
 
     if (existing && existing.direction === data.direction) {
@@ -68,28 +59,20 @@ export const recordSwipe = createServerFn({ method: 'POST' })
       return existing
     }
 
-    const swipe = await prisma.eventSwipe.upsert({
-      where: {
-        eventId_swiperId_swipedId: {
-          eventId: data.eventId,
-          swiperId,
-          swipedId: data.swipedId,
-        },
-      },
-      update: { direction: data.direction },
-      create: {
-        eventId: data.eventId,
-        swiperId,
-        swipedId: data.swipedId,
-        direction: data.direction,
-      },
-    })
+    const swipe = existing
+      ? await prisma.eventSwipe.update({
+          where: { id: existing.id },
+          data: { direction: data.direction },
+        })
+      : await prisma.eventSwipe.create({
+          data: { eventId, swiperId, swipedId: data.swipedId, direction: data.direction },
+        })
 
     if (data.direction === 'like' || data.direction === 'super') {
       const [mutual, swiperProfile] = await Promise.all([
         prisma.eventSwipe.findFirst({
           where: {
-            eventId: data.eventId,
+            eventId,
             swiperId: data.swipedId,
             swipedId: swiperId,
             direction: { in: ['like', 'super'] },
@@ -101,25 +84,27 @@ export const recordSwipe = createServerFn({ method: 'POST' })
       if (mutual) {
         const [u1, u2] = [swiperId, data.swipedId].sort()
         const existingMatch = await prisma.eventMatch.findFirst({
-          where: { eventId: data.eventId, user1Id: u1, user2Id: u2 },
+          where: { eventId, user1Id: u1, user2Id: u2 },
         })
 
         if (!existingMatch) {
-          const event = await prisma.event.findUnique({
-            where: { id: data.eventId },
-            select: { mysteryMode: true },
-          })
+          const event = eventId
+            ? await prisma.event.findUnique({
+                where: { id: eventId },
+                select: { mysteryMode: true },
+              })
+            : null
           const match = await prisma.eventMatch.create({
             data: {
-              eventId: data.eventId,
+              eventId,
               user1Id: u1,
               user2Id: u2,
               messagesUnlockedAt: event?.mysteryMode ? null : new Date(),
             },
           })
-          
+
           // Broadcast WebSocket notification for instant match alert
-          broadcastMatchCreated(data.eventId, swiperId, data.swipedId, match.id)
+          broadcastMatchCreated(eventId, swiperId, data.swipedId, match.id)
 
           // Award first_match badge to both users
           await Promise.all([
@@ -171,11 +156,10 @@ export const getLikes = createServerFn({ method: 'GET' })
       select: { eventId: true },
     })
     const eventIds = [...new Set(attendedEvents.map((a) => a.eventId))]
-    if (eventIds.length === 0) return []
 
     const swipes = await prisma.eventSwipe.findMany({
       where: {
-        eventId: { in: eventIds },
+        OR: [{ eventId: null }, { eventId: { in: eventIds } }],
         swipedId: session.user.id,
         direction: { in: ['like', 'super'] },
       },
@@ -378,12 +362,15 @@ export const sendMessage = createServerFn({ method: 'POST' })
 export const getSwipeDeck = createServerFn({ method: 'GET' })
   .inputValidator(
     z.object({
-      eventId: z.string(),
+      eventId: z.string().optional(),
       intent: z.enum(['dating', 'friends', 'networking']).optional(),
     })
   )
   .handler(async ({ data }) => {
-    // getEventProfiles handles boost sorting internally: boosted profiles
-    // appear first, each group is shuffled separately, then concatenated.
-    return getEventProfiles({ data })
+    // getEventProfiles/getGlobalProfiles handle boost sorting internally: boosted
+    // profiles appear first, each group is shuffled separately, then concatenated.
+    if (data.eventId) {
+      return getEventProfiles({ data: { eventId: data.eventId, intent: data.intent } })
+    }
+    return getGlobalProfiles({ data: { intent: data.intent } })
   })

@@ -6,6 +6,8 @@ services:
     container_name: meet_greet
     ports:
       - "6060:3000"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/meetandgreet
     restart: unless-stopped

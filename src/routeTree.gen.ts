@@ -14,8 +14,6 @@ import { Route as TermsRouteImport } from './routes/terms'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as SafetyRouteImport } from './routes/safety'
 import { Route as PrivacyRouteImport } from './routes/privacy'
-import { Route as PricingRouteImport } from './routes/pricing'
-import { Route as PremiumRouteImport } from './routes/premium'
 import { Route as OnboardingRouteImport } from './routes/onboarding'
 import { Route as NotificationsRouteImport } from './routes/notifications'
 import { Route as LoginRouteImport } from './routes/login'
@@ -77,16 +75,6 @@ const SafetyRoute = SafetyRouteImport.update({
 const PrivacyRoute = PrivacyRouteImport.update({
   id: '/privacy',
   path: '/privacy',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PricingRoute = PricingRouteImport.update({
-  id: '/pricing',
-  path: '/pricing',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PremiumRoute = PremiumRouteImport.update({
-  id: '/premium',
-  path: '/premium',
   getParentRoute: () => rootRouteImport,
 } as any)
 const OnboardingRoute = OnboardingRouteImport.update({
@@ -285,8 +273,6 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/notifications': typeof NotificationsRoute
   '/onboarding': typeof OnboardingRoute
-  '/premium': typeof PremiumRoute
-  '/pricing': typeof PricingRoute
   '/privacy': typeof PrivacyRoute
   '/safety': typeof SafetyRoute
   '/signup': typeof SignupRouteWithChildren
@@ -330,8 +316,6 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/notifications': typeof NotificationsRoute
   '/onboarding': typeof OnboardingRoute
-  '/premium': typeof PremiumRoute
-  '/pricing': typeof PricingRoute
   '/privacy': typeof PrivacyRoute
   '/safety': typeof SafetyRoute
   '/terms': typeof TermsRoute
@@ -376,8 +360,6 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/notifications': typeof NotificationsRoute
   '/onboarding': typeof OnboardingRoute
-  '/premium': typeof PremiumRoute
-  '/pricing': typeof PricingRoute
   '/privacy': typeof PrivacyRoute
   '/safety': typeof SafetyRoute
   '/signup': typeof SignupRouteWithChildren
@@ -424,8 +406,6 @@ export interface FileRouteTypes {
     | '/login'
     | '/notifications'
     | '/onboarding'
-    | '/premium'
-    | '/pricing'
     | '/privacy'
     | '/safety'
     | '/signup'
@@ -469,8 +449,6 @@ export interface FileRouteTypes {
     | '/login'
     | '/notifications'
     | '/onboarding'
-    | '/premium'
-    | '/pricing'
     | '/privacy'
     | '/safety'
     | '/terms'
@@ -514,8 +492,6 @@ export interface FileRouteTypes {
     | '/login'
     | '/notifications'
     | '/onboarding'
-    | '/premium'
-    | '/pricing'
     | '/privacy'
     | '/safety'
     | '/signup'
@@ -561,8 +537,6 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   NotificationsRoute: typeof NotificationsRoute
   OnboardingRoute: typeof OnboardingRoute
-  PremiumRoute: typeof PremiumRoute
-  PricingRoute: typeof PricingRoute
   PrivacyRoute: typeof PrivacyRoute
   SafetyRoute: typeof SafetyRoute
   SignupRoute: typeof SignupRouteWithChildren
@@ -628,20 +602,6 @@ declare module '@tanstack/react-router' {
       path: '/privacy'
       fullPath: '/privacy'
       preLoaderRoute: typeof PrivacyRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/pricing': {
-      id: '/pricing'
-      path: '/pricing'
-      fullPath: '/pricing'
-      preLoaderRoute: typeof PricingRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/premium': {
-      id: '/premium'
-      path: '/premium'
-      fullPath: '/premium'
-      preLoaderRoute: typeof PremiumRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/onboarding': {
@@ -953,8 +913,6 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   NotificationsRoute: NotificationsRoute,
   OnboardingRoute: OnboardingRoute,
-  PremiumRoute: PremiumRoute,
-  PricingRoute: PricingRoute,
   PrivacyRoute: PrivacyRoute,
   SafetyRoute: SafetyRoute,
   SignupRoute: SignupRouteWithChildren,

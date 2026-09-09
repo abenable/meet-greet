@@ -58,7 +58,7 @@ export function broadcastChatMessage(chatId: string, message: any, recipientId: 
   broadcastToUser(recipientId, wsMessage)
 }
 
-export function broadcastMatchCreated(eventId: string, user1Id: string, user2Id: string, matchId: string) {
+export function broadcastMatchCreated(eventId: string | null, user1Id: string, user2Id: string, matchId: string) {
   const wsMessage1: WSMessage = {
     type: 'match_created',
     payload: { eventId, matchId, peerId: user2Id },

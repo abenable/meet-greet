@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { useState, useEffect } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { Skeleton } from '@heroui/react'
 import {
   Compass,
@@ -16,40 +16,18 @@ import {
   Ban,
   Zap,
 } from 'lucide-react'
-import { getUserTier, setUserTier } from '#/server/subscriptions'
-import { getSession } from '#/server/auth'
 import { getBoostStatus } from '#/server/boosts'
-import { getAdStatus } from '#/server/ads'
-import { Film } from 'lucide-react'
 
 export const Route = createFileRoute('/settings/')({ component: SettingsPage })
 
 function SettingsPage() {
-  const queryClient = useQueryClient()
   const [darkMode, setDarkMode] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
-
-  const { data: session, isLoading: sessionLoading } = useQuery({
-    queryKey: ['session'],
-    queryFn: () => getSession(),
-  })
-
-  const { data: tierData, isLoading: tierLoading } = useQuery({
-    queryKey: ['user-tier'],
-    queryFn: () => getUserTier(),
-  })
 
   const { data: boostStatus, isLoading: boostLoading } = useQuery({
     queryKey: ['boost-status'],
     queryFn: () => getBoostStatus(),
   })
-
-  const { data: adStatus, isLoading: adLoading } = useQuery({
-    queryKey: ['ad-status'],
-    queryFn: () => getAdStatus(),
-  })
-
-  const isLoading = sessionLoading || tierLoading || boostLoading || adLoading
 
   useEffect(() => {
     const isDark = document.documentElement.classList.contains('dark')
@@ -99,68 +77,6 @@ function SettingsPage() {
       </div>
 
       <div className="mx-auto max-w-md space-y-6">
-        {/* Subscription */}
-        <div>
-          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--mag-ink-muted)]">
-            Subscription
-          </h2>
-          {isLoading ? (
-            <div className="overflow-hidden rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)] p-3 space-y-2">
-              <Skeleton className="h-5 w-32 rounded-lg" />
-              <Skeleton className="h-3 w-48 rounded-lg" />
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)]">
-              <div className="flex items-center gap-3 px-3 py-3">
-                <Zap className="h-5 w-5 text-[var(--mag-ink-soft)]" />
-                <div className="flex-1">
-                  <p className="text-sm text-[var(--mag-ink)]">
-                    Current Plan:{' '}
-                    <span className="font-semibold capitalize">
-                      {tierData?.tier ?? 'Free'}
-                    </span>
-                  </p>
-                  <p className="text-xs text-[var(--mag-ink-muted)]">
-                    {tierData?.tier === 'free'
-                      ? '2 active events, 6 swipes/day'
-                      : tierData?.tier === 'pro'
-                        ? 'Unlimited events & swipes'
-                        : tierData?.tier === 'host'
-                          ? 'Priority support + analytics'
-                          : ''}
-                  </p>
-                </div>
-              </div>
-              {session?.user?.role === 'admin' && (
-                <div className="border-t border-[var(--mag-line)] px-3 py-3">
-                  <p className="mb-2 text-xs font-medium text-[var(--mag-ink-muted)]">
-                    Admin: Set Tier
-                  </p>
-                  <div className="flex gap-2">
-                    {(['free', 'pro', 'host'] as const).map((t) => (
-                      <button
-                        key={t}
-                        onClick={async () => {
-                          await setUserTier({ data: { tier: t, durationMonths: 1 } })
-                          queryClient.invalidateQueries({ queryKey: ['user-tier'] })
-                          queryClient.invalidateQueries({ queryKey: ['session'] })
-                        }}
-                        className={`flex-1 rounded-full py-2 text-xs font-bold transition ${
-                          tierData?.tier === t
-                            ? 'bg-[var(--mag-ink)] text-[var(--mag-bg)]'
-                            : 'border border-[var(--mag-line)] bg-[var(--mag-surface)] text-[var(--mag-ink-soft)] hover:bg-[var(--mag-line)]'
-                        }`}
-                      >
-                        {t.charAt(0).toUpperCase() + t.slice(1)}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
         {/* Boosts */}
         <div>
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--mag-ink-muted)]">
@@ -195,33 +111,6 @@ function SettingsPage() {
             </div>
           )}
         </div>
-
-        {/* Ads */}
-        {adStatus?.showAds && (
-          <div>
-            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--mag-ink-muted)]">
-              Ads
-            </h2>
-            <div className="overflow-hidden rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)]">
-              <div className="flex items-center gap-3 px-3 py-3">
-                <Film className="h-5 w-5 text-[var(--mag-ink-soft)]" />
-                <div className="flex-1">
-                  <p className="text-sm text-[var(--mag-ink)]">
-                    Ads are enabled
-                  </p>
-                  <p className="text-xs text-[var(--mag-ink-muted)]">
-                    {adStatus.adsRemainingToday} rewarded ads remaining today
-                  </p>
-                </div>
-              </div>
-              <div className="border-t border-[var(--mag-line)] px-3 py-3">
-                <p className="text-xs text-[var(--mag-ink-muted)]">
-                  Upgrade to Pro to remove all ads and get unlimited swipes, events, and weekly boosts.
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
 
         {sections.map((section) => (
           <div key={section.title}>

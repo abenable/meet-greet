@@ -24,7 +24,7 @@ function LikesPage() {
   const [declinedIds, setDeclinedIds] = useState<Set<string>>(new Set())
 
   const likeBackMutation = useMutation({
-    mutationFn: async ({ eventId, swipedId }: { eventId: string; swipedId: string }) => {
+    mutationFn: async ({ eventId, swipedId }: { eventId?: string; swipedId: string }) => {
       return recordSwipe({ data: { eventId, swipedId, direction: 'like' } })
     },
     onSuccess: (result, vars) => {
@@ -72,9 +72,9 @@ function LikesPage() {
   })
 
   const handleLikeBack = (like: any) => {
-    if (!like.eventId || pendingIds.has(like.userId) || justMatchedIds.has(like.userId)) return
+    if (pendingIds.has(like.userId) || justMatchedIds.has(like.userId)) return
     setPendingIds((prev) => new Set(prev).add(like.userId))
-    likeBackMutation.mutate({ eventId: like.eventId, swipedId: like.userId })
+    likeBackMutation.mutate({ eventId: like.eventId || undefined, swipedId: like.userId })
   }
 
   const isLoading = likesLoading || matchesLoading || requestsLoading
@@ -156,7 +156,7 @@ function LikesPage() {
                       </div>
                       <button
                         onClick={() => handleLikeBack(like)}
-                        disabled={isPending || isMatched || !like.eventId}
+                        disabled={isPending || isMatched}
                         className={`flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:opacity-50 ${
                           isMatched
                             ? 'bg-[var(--mag-ink)] text-[var(--mag-bg)]'
@@ -199,7 +199,9 @@ function LikesPage() {
                   <div className="min-w-0 flex-1">
                     <h3 className="text-sm font-semibold text-[var(--mag-ink)]">{req.senderName}</h3>
                     <p className="truncate text-xs text-[var(--mag-ink-soft)]">{req.senderLocation || 'Wants to chat'}</p>
-                    <p className="text-[10px] text-[var(--mag-ink-muted)]">{req.eventName}</p>
+                    {req.eventName && (
+                      <p className="text-[10px] text-[var(--mag-ink-muted)]">{req.eventName}</p>
+                    )}
                   </div>
                   {!isDeclined ? (
                     <div className="flex shrink-0 items-center gap-2">

@@ -30,7 +30,7 @@ async function fetchSessionFromAuthHandler(): Promise<{ session: any; user: any 
     const [user, profile] = await Promise.all([
       prisma.user.findUnique({
         where: { id: data.user.id },
-        select: { disabledAt: true, role: true, image: true, subscriptionTier: true, subscriptionExpiresAt: true },
+        select: { disabledAt: true, role: true, image: true },
       }),
       prisma.profile.findUnique({
         where: { userId: data.user.id },
@@ -41,8 +41,6 @@ async function fetchSessionFromAuthHandler(): Promise<{ session: any; user: any 
     data.user.role = user?.role ?? 'user'
     const profilePhoto = profile?.photos && profile.photos.length > 0 ? profile.photos[0] : null
     data.user.image = profilePhoto ?? user?.image ?? data.user.image ?? null
-    data.user.subscriptionTier = user?.subscriptionTier ?? 'free'
-    data.user.subscriptionExpiresAt = user?.subscriptionExpiresAt ?? null
   }
 
   return data

@@ -5,7 +5,6 @@ import { Skeleton } from '@heroui/react'
 import { Calendar, MapPin, Plus, ArrowRight, Users, Clock, History, LogIn, ListOrdered, X, Star } from 'lucide-react'
 import { listEvents, getMyActiveEvent, leaveEvent, joinEvent, getMyWaitlistedEvents, removeFromWaitlist } from '#/server/events'
 import { getSession } from '#/server/auth'
-import { AdBanner } from '#/components/AdBanner'
 
 export const Route = createFileRoute('/events/')({ component: EventsExplorePage })
 
@@ -523,10 +522,6 @@ function EventsExplorePage() {
       )}
 
       </>)}
-
-      <div className="px-4 pb-4">
-        <AdBanner />
-      </div>
     </div>
   )
 }
