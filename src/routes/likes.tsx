@@ -257,11 +257,19 @@ function LikesPage() {
                 </div>
                 <div className="min-w-0 flex-1">
                   <h3 className="text-sm font-semibold text-[var(--mag-ink)]">{match.peerName}</h3>
-                  <p className="truncate text-xs text-[var(--mag-ink-soft)]">{match.lastMessage || 'New match!'}</p>
+                  <p className={`truncate text-xs ${match.unread > 0 ? 'font-medium text-[var(--mag-ink)]' : 'text-[var(--mag-ink-soft)]'}`}>
+                    {match.lastMessage || 'New match!'}
+                  </p>
                 </div>
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--mag-ink)] text-[var(--mag-bg)]">
-                  <MessageCircle className="h-4 w-4" />
-                </div>
+                {match.unread > 0 ? (
+                  <div className="flex h-6 min-w-6 shrink-0 items-center justify-center rounded-full bg-[var(--mag-sale)] px-1.5 text-[11px] font-bold text-white">
+                    {match.unread > 99 ? '99+' : match.unread}
+                  </div>
+                ) : (
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--mag-ink)] text-[var(--mag-bg)]">
+                    <MessageCircle className="h-4 w-4" />
+                  </div>
+                )}
               </Link>
             ))}
           </div>

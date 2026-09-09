@@ -50,10 +50,21 @@ export const updateProfile = createServerFn({ method: 'POST' })
     job: z.string().max(200).optional(),
     lookingFor: z.array(z.enum(['dating', 'friends', 'networking'])).optional(),
     discoveryMode: z.enum(['global', 'event']).optional(),
+    prefAgeMin: z.number().int().min(18).max(99).optional(),
+    prefAgeMax: z.number().int().min(18).max(99).optional(),
+    prefShowMe: z.enum(['Women', 'Men', 'Everyone']).optional(),
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
     const sanitized = sanitizeProfile(data)
+
+    if (
+      data.prefAgeMin !== undefined &&
+      data.prefAgeMax !== undefined &&
+      data.prefAgeMin > data.prefAgeMax
+    ) {
+      throw new Error('Minimum age cannot be greater than maximum age')
+    }
 
     return prisma.profile.upsert({
       where: { userId: session.user.id },
@@ -68,6 +79,9 @@ export const updateProfile = createServerFn({ method: 'POST' })
         ...(sanitized.job !== undefined && { job: sanitized.job }),
         ...(data.lookingFor !== undefined && { lookingFor: data.lookingFor }),
         ...(data.discoveryMode !== undefined && { discoveryMode: data.discoveryMode }),
+        ...(data.prefAgeMin !== undefined && { prefAgeMin: data.prefAgeMin }),
+        ...(data.prefAgeMax !== undefined && { prefAgeMax: data.prefAgeMax }),
+        ...(data.prefShowMe !== undefined && { prefShowMe: data.prefShowMe }),
       },
       create: {
         userId: session.user.id,
@@ -79,6 +93,9 @@ export const updateProfile = createServerFn({ method: 'POST' })
         interests: sanitized.interests ?? [],
         lookingFor: data.lookingFor ?? [],
         discoveryMode: data.discoveryMode ?? 'global',
+        prefAgeMin: data.prefAgeMin ?? 18,
+        prefAgeMax: data.prefAgeMax ?? 99,
+        prefShowMe: data.prefShowMe ?? 'Everyone',
       },
     })
   })

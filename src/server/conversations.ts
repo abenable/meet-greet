@@ -130,6 +130,20 @@ export const getConversations = createServerFn({ method: 'GET' })
       return profile?.verifiedAt ?? null
     }
 
+    // Unread counts per match (messages from the peer I haven't read yet)
+    const unreadGroups = filteredMatches.length > 0
+      ? await prisma.eventMessage.groupBy({
+          by: ['matchId'],
+          where: {
+            matchId: { in: filteredMatches.map((m) => m.id) },
+            senderId: { not: myId },
+            readAt: null,
+          },
+          _count: { id: true },
+        })
+      : []
+    const unreadCountByMatchId = new Map(unreadGroups.map((g) => [g.matchId, g._count.id]))
+
     // Build match conversation list
     const matchConversations = filteredMatches
       .filter((match) => {
@@ -151,7 +165,7 @@ export const getConversations = createServerFn({ method: 'GET' })
           messagesUnlockedAt: match.messagesUnlockedAt,
           lastMessage: match.messages[0]?.content ?? 'New match!',
           lastMessageAt: match.messages[0]?.createdAt ?? match.createdAt,
-          unreadCount: 0,
+          unreadCount: unreadCountByMatchId.get(match.id) ?? 0,
         }
       })
 
@@ -466,7 +480,17 @@ export const markChatRead = createServerFn({ method: 'POST' })
     const myId = session.user.id
 
     if (chatId.startsWith('match_')) {
-      // Match messages don't have readAt yet; nothing to mark
+      const matchId = chatId.slice('match_'.length)
+      const match = await prisma.eventMatch.findFirst({
+        where: { id: matchId, OR: [{ user1Id: myId }, { user2Id: myId }] },
+      })
+      if (!match) throw new Error('Match not found')
+
+      await prisma.eventMessage.updateMany({
+        where: { matchId, senderId: { not: myId }, readAt: null },
+        data: { readAt: new Date() },
+      })
+
       return { success: true }
     }
 

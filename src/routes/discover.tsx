@@ -2,9 +2,9 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { useState, useRef, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Skeleton } from '@heroui/react'
-import { X, Heart, MapPin, Users, ArrowRight, Flag, MessageCircle, Briefcase, Zap } from 'lucide-react'
+import { X, Heart, MapPin, Users, ArrowRight, Flag, MessageCircle, Briefcase, Zap, RotateCcw, Sparkles } from 'lucide-react'
 import { getMyActiveEvent, reportUser } from '#/server/events'
-import { recordSwipe, getSwipeDeck } from '#/server/swipes'
+import { recordSwipe, getSwipeDeck, rewindLastSwipe } from '#/server/swipes'
 import { sendMessageRequest } from '#/server/requests'
 import { getMyProfile } from '#/server/profiles'
 import AvatarImage from '#/components/AvatarImage'
@@ -23,6 +23,23 @@ const REPORT_REASONS = [
 function formatNameWithGender(name: string | null, gender: string | null): string {
   const initial = gender === 'Male' ? 'M' : gender === 'Female' ? 'F' : ''
   return initial ? `${name || ''}, ${initial}` : (name || '')
+}
+
+const ONLINE_THRESHOLD_MS = 5 * 60 * 1000
+
+function formatLastActive(dateLike: string | Date | null | undefined): { label: string; isOnline: boolean } | null {
+  if (!dateLike) return null
+  const date = new Date(dateLike)
+  if (Number.isNaN(date.getTime())) return null
+  const diffMs = Date.now() - date.getTime()
+  if (diffMs < ONLINE_THRESHOLD_MS) return { label: 'Active now', isOnline: true }
+  const minutes = Math.floor(diffMs / 60000)
+  if (minutes < 60) return { label: `Active ${minutes}m ago`, isOnline: false }
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return { label: `Active ${hours}h ago`, isOnline: false }
+  const days = Math.floor(hours / 24)
+  if (days < 30) return { label: `Active ${days}d ago`, isOnline: false }
+  return null
 }
 
 function DiscoverPage() {
@@ -52,6 +69,8 @@ function DiscoverPage() {
   const [swipedIds, setSwipedIds] = useState<Set<string>>(new Set())
   const [requestedIds, setRequestedIds] = useState<Set<string>>(new Set())
   const [requestPendingIds, setRequestPendingIds] = useState<Set<string>>(new Set())
+  const [lastSwipe, setLastSwipe] = useState<{ userId: string; index: number } | null>(null)
+  const [rewindError, setRewindError] = useState('')
 
   // Report modal state
   const [reportModalOpen, setReportModalOpen] = useState(false)
@@ -82,6 +101,28 @@ function DiscoverPage() {
     },
   })
 
+  const rewindMutation = useMutation({
+    mutationFn: (vars: { userId: string; index: number }) =>
+      rewindLastSwipe({ data: { eventId: effectiveEventId, swipedId: vars.userId } }),
+    onSuccess: (result, vars) => {
+      if (!result.success) {
+        setRewindError(result.message || 'Unable to rewind')
+        setTimeout(() => setRewindError(''), 2000)
+        return
+      }
+      setSwipedIds((prev) => {
+        const next = new Set(prev)
+        next.delete(vars.userId)
+        return next
+      })
+      setLastSwipe(null)
+      setCurrentIndex(vars.index)
+      const container = containerRef.current
+      const target = container?.children[vars.index] as HTMLElement | undefined
+      target?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    },
+  })
+
   const reportMutation = useMutation({
     mutationFn: reportUser,
     onSuccess: (res) => {
@@ -105,6 +146,7 @@ function DiscoverPage() {
     if (swipedIds.has(profile.userId)) return
 
     setSwipedIds((prev) => new Set(prev).add(profile.userId))
+    setLastSwipe({ userId: profile.userId, index: currentIndex })
     swipeMutation.mutate({ data: { eventId: effectiveEventId, swipedId: profile.userId, direction } })
 
     const container = containerRef.current
@@ -114,6 +156,11 @@ function DiscoverPage() {
       ;(container.children[next] as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
   }, [currentIndex, effectiveEventId, baseProfiles, swipeMutation, swipedIds])
+
+  const handleRewind = useCallback(() => {
+    if (!lastSwipe || rewindMutation.isPending) return
+    rewindMutation.mutate(lastSwipe)
+  }, [lastSwipe, rewindMutation])
 
   const handleRequest = useCallback(() => {
     const profile = baseProfiles[currentIndex]
@@ -219,6 +266,13 @@ function DiscoverPage() {
           ))}
         </div>
       </div>
+      {rewindError && (
+        <div className="shrink-0 px-4 pb-2">
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-center">
+            <p className="text-xs font-medium text-amber-800">{rewindError}</p>
+          </div>
+        </div>
+      )}
       <div
         ref={containerRef}
         onScroll={onScroll}
@@ -229,6 +283,8 @@ function DiscoverPage() {
           const photoIdx = photoIndices[profile.userId] ?? 0
           const pic = profile.photos[photoIdx] ?? ''
           const hasPhotos = profile.photos.length > 0
+          const lastActive = formatLastActive((profile as any).lastActiveDate)
+          const sharedInterests: string[] = (profile as any).sharedInterests ?? []
           return (
             <section
               key={profile.userId}
@@ -291,6 +347,14 @@ function DiscoverPage() {
                   {formatNameWithGender(profile.name, profile.gender)}
                   {profile.verifiedAt && <VerifiedBadge />}
                 </h2>
+                {lastActive && (
+                  <div className="mt-1 flex items-center gap-1.5 text-xs font-medium text-white/80">
+                    {lastActive.isOnline && (
+                      <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                    )}
+                    <span>{lastActive.label}</span>
+                  </div>
+                )}
                 {profile.lookingFor && profile.lookingFor.length > 0 && (
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
                     {profile.lookingFor.map((intent) => (
@@ -307,6 +371,15 @@ function DiscoverPage() {
                   <MapPin className="h-4 w-4" />
                   <span>{profile.location}</span>
                 </div>
+                {sharedInterests.length > 0 && (
+                  <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-[var(--mag-ink)]/80 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur-sm">
+                    <Sparkles className="h-3 w-3" />
+                    <span>
+                      {sharedInterests.length} thing{sharedInterests.length === 1 ? '' : 's'} in common:{' '}
+                      {sharedInterests.slice(0, 3).join(', ')}
+                    </span>
+                  </div>
+                )}
                 <p className="mt-2 max-w-md text-sm leading-relaxed text-white/80">{profile.bio}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {profile.interests.slice(0, 5).map((interest) => (
@@ -320,6 +393,16 @@ function DiscoverPage() {
                 </div>
               </div>
               <div className="absolute right-3 bottom-28 flex flex-col items-center gap-3">
+                {lastSwipe && (
+                  <button
+                    onClick={handleRewind}
+                    disabled={rewindMutation.isPending}
+                    className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/30 backdrop-blur-sm transition hover:scale-110 disabled:opacity-40"
+                    title="Rewind last swipe"
+                  >
+                    <RotateCcw className="h-4 w-4 text-amber-300" />
+                  </button>
+                )}
                 <button
                   onClick={() => handleAction('like')}
                   disabled={swipedIds.has(profile.userId)}

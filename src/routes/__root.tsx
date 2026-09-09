@@ -7,6 +7,7 @@ import PWAInstallPrompt from '../components/PWAInstallPrompt'
 import { WebSocketProvider } from '../integrations/websocket/WebSocketProvider'
 import { getVapidPublicKey, subscribePush } from '#/server/notifications'
 import { checkAndUpdateStreak } from '#/server/badges'
+import { pingPresence } from '#/server/presence'
 
 import appCss from '../styles.css?url'
 
@@ -173,6 +174,18 @@ function RootLayout() {
       }
     }
     void run()
+  }, [session?.user])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!session?.user) return
+
+    const ping = () => {
+      pingPresence().catch(() => {})
+    }
+    ping()
+    const interval = setInterval(ping, 60 * 1000)
+    return () => clearInterval(interval)
   }, [session?.user])
 
   return (

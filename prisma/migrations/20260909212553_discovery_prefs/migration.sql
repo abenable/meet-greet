@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "Profile" ADD COLUMN     "prefAgeMax" INTEGER NOT NULL DEFAULT 99,
+ADD COLUMN     "prefAgeMin" INTEGER NOT NULL DEFAULT 18,
+ADD COLUMN     "prefShowMe" TEXT NOT NULL DEFAULT 'Everyone';

@@ -85,6 +85,9 @@ model Profile {
   boostedUntil DateTime?
   lastBoostedAt DateTime?
   discoveryMode String  @default("global") // 'global' | 'event'
+  prefAgeMin  Int      @default(18)
+  prefAgeMax  Int      @default(99)
+  prefShowMe  String   @default("Everyone") // 'Women' | 'Men' | 'Everyone'
   createdAt   DateTime  @default(now())
   updatedAt   DateTime @updatedAt
 }

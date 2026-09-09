@@ -147,6 +147,36 @@ export const recordSwipe = createServerFn({ method: 'POST' })
     return swipe
   })
 
+export const rewindLastSwipe = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({
+    eventId: z.string().optional(),
+    swipedId: z.string(),
+  }))
+  .handler(async ({ data }) => {
+    const session = await requireSession()
+    const swiperId = session.user.id
+    const eventId = data.eventId ?? null
+
+    const swipe = await prisma.eventSwipe.findFirst({
+      where: { eventId, swiperId, swipedId: data.swipedId },
+    })
+    if (!swipe) {
+      return { success: false, message: 'Nothing to rewind' }
+    }
+
+    const [u1, u2] = [swiperId, data.swipedId].sort()
+    const existingMatch = await prisma.eventMatch.findFirst({
+      where: { eventId, user1Id: u1, user2Id: u2 },
+    })
+    if (existingMatch) {
+      return { success: false, message: "You already matched — can't rewind" }
+    }
+
+    await prisma.eventSwipe.delete({ where: { id: swipe.id } })
+
+    return { success: true }
+  })
+
 export const getLikes = createServerFn({ method: 'GET' })
   .handler(async () => {
     const session = await requireSession()
@@ -277,6 +307,19 @@ export const getMatches = createServerFn({ method: 'GET' })
       peerIds.filter((id) => !userById.get(id)?.disabledAt && !blockedIds.has(id))
     )
 
+    const unreadGroups = matches.length > 0
+      ? await prisma.eventMessage.groupBy({
+          by: ['matchId'],
+          where: {
+            matchId: { in: matches.map((m) => m.id) },
+            senderId: { not: session.user.id },
+            readAt: null,
+          },
+          _count: { id: true },
+        })
+      : []
+    const unreadCountByMatchId = new Map(unreadGroups.map((g) => [g.matchId, g._count.id]))
+
     return matches
       .filter((match) => {
         const peerId = match.user1Id === session.user.id ? match.user2Id : match.user1Id
@@ -300,7 +343,7 @@ export const getMatches = createServerFn({ method: 'GET' })
           peerPhoto: photos[0],
           lastMessage: match.messages[0]?.content ?? '',
           lastMessageAt: match.messages[0]?.createdAt ?? match.createdAt,
-          unread: 0,
+          unread: unreadCountByMatchId.get(match.id) ?? 0,
         }
       })
   })

@@ -39,6 +39,19 @@ function seededShuffle<T>(arr: T[], seed: string): T[] {
   return result
 }
 
+function calculateAge(birthDate: string | null | undefined): number | null {
+  if (!birthDate) return null
+  const dob = new Date(birthDate)
+  if (Number.isNaN(dob.getTime())) return null
+  const now = new Date()
+  let age = now.getFullYear() - dob.getFullYear()
+  const hasHadBirthdayThisYear =
+    now.getMonth() > dob.getMonth() ||
+    (now.getMonth() === dob.getMonth() && now.getDate() >= dob.getDate())
+  if (!hasHadBirthdayThisYear) age -= 1
+  return age
+}
+
 async function getFlaggedUserIds(): Promise<string[]> {
   // Auto-moderation filter: users with >= 2 pending reports in the last 24h
   // are effectively shadow-banned from discovery and attendee lists
@@ -594,15 +607,16 @@ async function buildSwipeDeck({
     }),
     prisma.user.findMany({
       where: { id: { in: unblockedUserIds } },
-      select: { id: true, name: true, image: true, email: true, disabledAt: true },
+      select: { id: true, name: true, image: true, email: true, disabledAt: true, lastActiveDate: true },
     }),
     prisma.profile.findUnique({
       where: { userId: myUserId },
-      select: { lookingFor: true },
+      select: { lookingFor: true, interests: true, prefAgeMin: true, prefAgeMax: true, prefShowMe: true },
     }),
   ])
 
   const myLookingFor = myProfile?.lookingFor ?? []
+  const myInterests = myProfile?.interests ?? []
   const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
 
   // Optional intent filter
@@ -615,11 +629,27 @@ async function buildSwipeDeck({
     if (intentFilteredUserIds.length === 0) return []
   }
 
+  // Age / gender preference filters — only exclude a candidate when we can
+  // actually tell they don't match (missing data is never held against them).
+  const prefAgeMin = myProfile?.prefAgeMin ?? 18
+  const prefAgeMax = myProfile?.prefAgeMax ?? 99
+  const prefShowMe = myProfile?.prefShowMe ?? 'Everyone'
+  const prefFilteredUserIds = intentFilteredUserIds.filter((id) => {
+    const p = profileByUserId.get(id)
+    const age = calculateAge(p?.birthDate)
+    if (age !== null && (age < prefAgeMin || age > prefAgeMax)) return false
+    if (prefShowMe !== 'Everyone' && p?.gender) {
+      const wantsGender = prefShowMe === 'Women' ? 'Female' : 'Male'
+      if (p.gender !== wantsGender) return false
+    }
+    return true
+  })
+
   const userById = new Map(users.map((u) => [u.id, u]))
 
   // Filter out disabled accounts and shadow-banned users (auto-moderation)
   const flaggedIds = await getFlaggedUserIds()
-  const activeUserIds = intentFilteredUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
+  const activeUserIds = prefFilteredUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
 
   const now = new Date()
 
@@ -663,6 +693,7 @@ async function buildSwipeDeck({
     const profile = profileByUserId.get(userId)
     const user = userById.get(userId)
     const isBoosted = !!profile?.boostedUntil && profile.boostedUntil > now
+    const sharedInterests = (profile?.interests ?? []).filter((i) => myInterests.includes(i))
     if (profile) {
       return {
         ...profile,
@@ -674,6 +705,8 @@ async function buildSwipeDeck({
               ? [user.image]
               : [],
         isBoosted,
+        sharedInterests,
+        lastActiveDate: user?.lastActiveDate ?? null,
       }
     }
     return {
@@ -693,6 +726,8 @@ async function buildSwipeDeck({
       createdAt: new Date(),
       updatedAt: new Date(),
       isBoosted: false,
+      sharedInterests: [] as string[],
+      lastActiveDate: user?.lastActiveDate ?? null,
     }
   })
 }
@@ -813,6 +848,9 @@ export const getEventAttendees = createServerFn({ method: 'GET' })
         boostedUntil: null,
         lastBoostedAt: null,
         discoveryMode: 'global',
+        prefAgeMin: 18,
+        prefAgeMax: 99,
+        prefShowMe: 'Everyone',
         createdAt: new Date(),
         updatedAt: new Date(),
       }

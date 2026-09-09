@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { ArrowLeft, MapPin, Users, SlidersHorizontal, Globe, Calendar } from 'lucide-react'
-import { useState } from 'react'
+import { ArrowLeft, Users, SlidersHorizontal, Globe, Calendar, Check } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Skeleton } from '@heroui/react'
 import { getMyProfile, updateProfile } from '#/server/profiles'
@@ -8,12 +8,13 @@ import { getMyActiveEvent } from '#/server/events'
 
 export const Route = createFileRoute('/settings/discovery')({ component: DiscoverySettingsPage })
 
+const SHOW_ME_OPTIONS = ['Women', 'Men', 'Everyone'] as const
+
 function DiscoverySettingsPage() {
   const queryClient = useQueryClient()
-  const [distance, setDistance] = useState(25)
-  const [ageMin, setAgeMin] = useState(21)
-  const [ageMax, setAgeMax] = useState(35)
-  const [showMe, setShowMe] = useState('Everyone')
+  const [ageMin, setAgeMin] = useState(18)
+  const [ageMax, setAgeMax] = useState(99)
+  const [savedJustNow, setSavedJustNow] = useState(false)
 
   const { data: profile, isLoading: profileLoading } = useQuery({
     queryKey: ['my-profile'],
@@ -24,15 +25,40 @@ function DiscoverySettingsPage() {
     queryFn: () => getMyActiveEvent(),
   })
 
+  useEffect(() => {
+    if (!profile) return
+    setAgeMin(profile.prefAgeMin)
+    setAgeMax(profile.prefAgeMax)
+  }, [profile])
+
   const discoveryMode = profile?.discoveryMode ?? 'global'
+  const showMe = profile?.prefShowMe ?? 'Everyone'
+
+  const invalidateAfterSave = () => {
+    queryClient.invalidateQueries({ queryKey: ['my-profile'] })
+    queryClient.invalidateQueries({ queryKey: ['swipe-deck'] })
+    setSavedJustNow(true)
+    setTimeout(() => setSavedJustNow(false), 1500)
+  }
 
   const setModeMutation = useMutation({
     mutationFn: (mode: 'global' | 'event') => updateProfile({ data: { discoveryMode: mode } }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['my-profile'] })
-      queryClient.invalidateQueries({ queryKey: ['swipe-deck'] })
-    },
+    onSuccess: invalidateAfterSave,
   })
+
+  const setShowMeMutation = useMutation({
+    mutationFn: (value: (typeof SHOW_ME_OPTIONS)[number]) => updateProfile({ data: { prefShowMe: value } }),
+    onSuccess: invalidateAfterSave,
+  })
+
+  const setAgeRangeMutation = useMutation({
+    mutationFn: (range: { prefAgeMin: number; prefAgeMax: number }) => updateProfile({ data: range }),
+    onSuccess: invalidateAfterSave,
+  })
+
+  const commitAgeRange = () => {
+    setAgeRangeMutation.mutate({ prefAgeMin: ageMin, prefAgeMax: ageMax })
+  }
 
   return (
     <main className="page-wrap px-4 py-4">
@@ -92,22 +118,6 @@ function DiscoverySettingsPage() {
 
         <div className="rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)] p-3">
           <div className="mb-3 flex items-center gap-2">
-            <MapPin className="h-4 w-4 text-[var(--mag-ink-soft)]" />
-            <h2 className="text-sm font-semibold text-[var(--mag-ink)]">Maximum Distance</h2>
-            <span className="ml-auto text-sm font-medium text-[var(--mag-ink)]">{distance} mi</span>
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={100}
-            value={distance}
-            onChange={(e) => setDistance(Number(e.target.value))}
-            className="w-full accent-[#111111]"
-          />
-        </div>
-
-        <div className="rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)] p-3">
-          <div className="mb-3 flex items-center gap-2">
             <Users className="h-4 w-4 text-[var(--mag-ink-soft)]" />
             <h2 className="text-sm font-semibold text-[var(--mag-ink)]">Age Range</h2>
             <span className="ml-auto text-sm font-medium text-[var(--mag-ink)]">{ageMin} - {ageMax}</span>
@@ -116,20 +126,29 @@ function DiscoverySettingsPage() {
             <input
               type="range"
               min={18}
-              max={80}
+              max={99}
               value={ageMin}
               onChange={(e) => setAgeMin(Math.min(Number(e.target.value), ageMax))}
+              onMouseUp={commitAgeRange}
+              onTouchEnd={commitAgeRange}
+              onKeyUp={commitAgeRange}
               className="w-full accent-[#111111]"
             />
             <input
               type="range"
               min={18}
-              max={80}
+              max={99}
               value={ageMax}
               onChange={(e) => setAgeMax(Math.max(Number(e.target.value), ageMin))}
+              onMouseUp={commitAgeRange}
+              onTouchEnd={commitAgeRange}
+              onKeyUp={commitAgeRange}
               className="w-full accent-[#111111]"
             />
           </div>
+          <p className="mt-2 text-[10px] text-[var(--mag-ink-muted)]">
+            People outside this range won't show up in your deck. Profiles without a birthday are always shown.
+          </p>
         </div>
 
         <div className="rounded-2xl border border-[var(--mag-line)] bg-[var(--mag-card)] p-3">
@@ -138,11 +157,12 @@ function DiscoverySettingsPage() {
             <h2 className="text-sm font-semibold text-[var(--mag-ink)]">Show Me</h2>
           </div>
           <div className="flex flex-wrap gap-2">
-            {['Women', 'Men', 'Everyone'].map((option) => (
+            {SHOW_ME_OPTIONS.map((option) => (
               <button
                 key={option}
-                onClick={() => setShowMe(option)}
-                className={`rounded-full px-4 py-2 text-xs font-medium transition ${
+                onClick={() => setShowMeMutation.mutate(option)}
+                disabled={setShowMeMutation.isPending}
+                className={`rounded-full px-4 py-2 text-xs font-medium transition disabled:opacity-60 ${
                   showMe === option
                     ? 'bg-[var(--mag-ink)] text-[var(--mag-bg)]'
                     : 'border border-[var(--mag-line)] bg-[var(--mag-card)] text-[var(--mag-ink)]'
@@ -153,6 +173,12 @@ function DiscoverySettingsPage() {
             ))}
           </div>
         </div>
+
+        {savedJustNow && (
+          <p className="flex items-center justify-center gap-1.5 text-xs font-medium text-[var(--mag-success)]">
+            <Check className="h-3.5 w-3.5" /> Saved
+          </p>
+        )}
       </div>
     </main>
   )
