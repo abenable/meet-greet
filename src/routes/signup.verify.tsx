@@ -60,11 +60,14 @@ function SignupVerifyPage() {
     try {
       const res = await verifyEmailOtpFn({ data: { email, otp } })
       if (!res.valid) {
-        setError('Invalid or expired code. Please try again.')
+        setError(res.message || 'Invalid or expired code. Please try again.')
         setLoading(false)
         return
       }
-      navigate({ to: isSafeRedirect(redirect) ? redirect : '/discover' })
+      // Full reload rather than a client navigation: the router context still
+      // holds a session snapshot with emailVerified=false, and every loader on
+      // the destination reads it.
+      window.location.href = isSafeRedirect(redirect) ? redirect : '/discover'
     } catch (err: any) {
       setError(err?.message || 'Something went wrong')
     } finally {

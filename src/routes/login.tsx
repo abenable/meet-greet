@@ -3,7 +3,7 @@ import { useServerFn } from '@tanstack/react-start'
 import { useState } from 'react'
 import { Mail, Lock, Eye, EyeOff, ArrowRight } from 'lucide-react'
 import { authClient } from '#/lib/auth-client'
-import { isEmailVerified, sendEmailVerificationOtp } from '#/server/auth'
+import { getSession, sendEmailVerificationOtp } from '#/server/auth'
 import { normalizeAuthError, EMAIL_REGEX } from '#/lib/auth-errors'
 import Logo from '#/components/Logo'
 
@@ -17,7 +17,7 @@ function LoginPage() {
   const navigate = useNavigate()
   const search = useSearch({ from: '/login' })
   const redirect = typeof (search as any)?.redirect === 'string' ? (search as any).redirect : ''
-  const isEmailVerifiedFn = useServerFn(isEmailVerified)
+  const getSessionFn = useServerFn(getSession)
   const sendEmailVerificationOtpFn = useServerFn(sendEmailVerificationOtp)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -46,12 +46,14 @@ function LoginPage() {
         return
       }
 
-      const { verified } = await isEmailVerifiedFn({ data: normalizedEmail })
-      if (!verified) {
-        const otpRes = await sendEmailVerificationOtpFn({ data: normalizedEmail })
-        if (!otpRes.success && otpRes.message) {
-          console.warn('OTP send warning:', otpRes.message)
-        }
+      // Read verification state off our own session rather than asking about
+      // an arbitrary address — the old isEmailVerified endpoint took any email
+      // with no session and doubled as an account-existence oracle. The server
+      // enforces this too: requireSession() rejects unverified sessions, so
+      // this branch is UX, not security.
+      const session = await getSessionFn()
+      if (!session?.user?.emailVerified) {
+        await sendEmailVerificationOtpFn({ data: normalizedEmail })
         navigate({ to: '/signup/verify', search: { email: normalizedEmail, redirect } })
         return
       }

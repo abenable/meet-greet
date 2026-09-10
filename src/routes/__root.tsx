@@ -77,8 +77,10 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
       // If session fetch fails, treat as unauthenticated
     }
 
+    const isVerified = !!session?.user?.emailVerified
+
     if (isPublic) {
-      if (session?.session && location.pathname === '/') {
+      if (session?.session && isVerified && location.pathname === '/') {
         throw redirect({ to: '/discover' })
       }
       return { session }
@@ -86,6 +88,16 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
 
     if (!session?.session) {
       throw redirect({ to: '/login' })
+    }
+
+    // A session exists but the address was never confirmed. requireSession()
+    // rejects these on the server, so send them to the OTP screen rather than
+    // letting every loader on the page fail.
+    if (!isVerified) {
+      throw redirect({
+        to: '/signup/verify',
+        search: { email: session.user.email, redirect: location.pathname },
+      })
     }
 
     return { session }
@@ -180,12 +192,22 @@ function RootLayout() {
     if (typeof window === 'undefined') return
     if (!session?.user) return
 
+    // Heartbeat every 3 minutes instead of every minute, and only while the tab
+    // is actually visible — a background tab pinning a DB write per minute per
+    // session was pure churn on the most-joined table in the schema. The server
+    // additionally skips the write unless the stored timestamp is already
+    // stale, so the real write rate is far lower than the request rate.
     const ping = () => {
+      if (document.visibilityState !== 'visible') return
       pingPresence().catch(() => {})
     }
     ping()
-    const interval = setInterval(ping, 60 * 1000)
-    return () => clearInterval(interval)
+    const interval = setInterval(ping, 3 * 60 * 1000)
+    document.addEventListener('visibilitychange', ping)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', ping)
+    }
   }, [session?.user])
 
   return (

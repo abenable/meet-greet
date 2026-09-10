@@ -47,6 +47,10 @@ export const activateBoost = createServerFn({ method: 'POST' })
 export const isProfileBoosted = createServerFn({ method: 'GET' })
   .inputValidator(z.string())
   .handler(async ({ data: userId }) => {
+    // Was unauthenticated: it took an arbitrary user id and reported whether
+    // that account exists, which is a free enumeration oracle.
+    await requireSession()
+
     const profile = await prisma.profile.findUnique({
       where: { userId },
       select: { boostedUntil: true },

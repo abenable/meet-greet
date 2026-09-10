@@ -22,7 +22,14 @@ async function promoteToAdmin(email: string) {
   console.log(`Promoted ${email} (id: ${user.id}) to admin`)
 }
 
-promoteToAdmin('ableabenaitwe@gmail.com')
+const email = process.argv[2]
+
+if (!email) {
+  console.error('Usage: bun run scripts/promote-admin.ts <email>')
+  process.exit(1)
+}
+
+promoteToAdmin(email)
   .catch((e) => {
     console.error(e)
     process.exit(1)
