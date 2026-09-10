@@ -19,6 +19,38 @@ if (process.env.NODE_ENV === 'production' && baseURL.includes('localhost')) {
 }
 
 /**
+ * Whether the session cookie should carry the Secure attribute.
+ *
+ * Derived from BETTER_AUTH_URL's scheme, not NODE_ENV. better-auth already
+ * gets this right on its own — createCookieGetter() computes `secure` from
+ * baseURL's scheme when useSecureCookies is left unset (see
+ * node_modules/better-auth/dist/cookies/index.mjs). A previous version of this
+ * file passed `secure: NODE_ENV === 'production'` via defaultCookieAttributes,
+ * which is spread in *after* that computed default and so silently overrode
+ * it: any production deployment not yet behind HTTPS (a fresh docker-compose
+ * host, a LAN address, a domain without a cert yet) forced Secure onto a
+ * cookie issued over plain HTTP. Browsers refuse to store a Secure cookie set
+ * from a non-HTTPS origin (localhost is exempted, which is why this was easy
+ * to miss testing locally) — so sign-in would 200 with a Set-Cookie header
+ * the browser silently discarded. The very next request, cookie-less, read as
+ * signed out: an instant "logged out" on the first click, and a login that
+ * never survived a refresh.
+ */
+const isHttps = baseURL.startsWith('https://')
+
+if (process.env.NODE_ENV === 'production' && !isHttps && !baseURL.includes('localhost')) {
+  // Not an error — the cookie is correctly issued without Secure so it
+  // actually survives on a plain-HTTP origin. Flagged because it usually
+  // means TLS hasn't been put in front yet, which is worth knowing in prod.
+  console.warn(
+    `[auth] BETTER_AUTH_URL is "${baseURL}" (not https) in production. Session cookies are ` +
+      'being issued without the Secure attribute so they still work — but if this deployment ' +
+      'is meant to be reachable over HTTPS, put a TLS-terminating proxy in front and point ' +
+      'BETTER_AUTH_URL at the https origin; Secure will then be enabled automatically.',
+  )
+}
+
+/**
  * Origins allowed to drive auth requests. Defaults to the app's own origin;
  * add more (a separate marketing domain, a preview deployment) via
  * ADDITIONAL_TRUSTED_ORIGINS as a comma-separated list.
@@ -96,10 +128,14 @@ export const auth = betterAuth({
       // here.
       ipAddressHeaders: [CLIENT_IP_HEADER],
     },
+    // Ties the Secure attribute to the scheme in isHttps above, not NODE_ENV —
+    // see the comment there. Leaving `secure` out of defaultCookieAttributes
+    // is deliberate: it would be spread in after this and override it right
+    // back to a static value, the exact bug this file used to have.
+    useSecureCookies: isHttps,
     defaultCookieAttributes: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
     },
   },
   databaseHooks: {

@@ -13,7 +13,6 @@ import {
   ListOrdered,
 } from 'lucide-react'
 import { getEventByCode, joinEvent } from '#/server/events'
-import { getSession } from '#/server/auth'
 
 export const Route = createFileRoute('/events/join/$code')({
   component: ShareJoinPage,
@@ -28,10 +27,15 @@ function ShareJoinPage() {
   const [waitlisted, setWaitlisted] = useState(false)
   const [confirmInfo, setConfirmInfo] = useState<{ currentEventName: string; eventName: string } | null>(null)
 
-  const { data: session, isLoading: sessionLoading } = useQuery({
-    queryKey: ['session'],
-    queryFn: () => getSession(),
-  })
+  // Read the session off the root route's context rather than issuing a
+  // second, independent getSession() call. The root beforeLoad has already
+  // resolved it once for this navigation (including the "lookup failed, don't
+  // assume signed-out" handling in __root.tsx) — refetching here duplicated
+  // the round trip and, worse, had its own cruder redirect-on-any-falsy-value
+  // logic that didn't share that safety: a session that failed to resolve for
+  // any transient reason read the same as a confirmed sign-out and bounced
+  // straight to /login, discarding whatever the visitor was doing here.
+  const { session } = Route.useRouteContext()
 
   const { data: event, isLoading: eventLoading } = useQuery({
     queryKey: ['event-by-code', code],
@@ -39,12 +43,7 @@ function ShareJoinPage() {
   })
 
   useEffect(() => {
-    if (sessionLoading || eventLoading) return
-
-    if (session === null) {
-      navigate({ to: '/login', search: { redirect: `/events/join/${code}` } })
-      return
-    }
+    if (eventLoading) return
 
     if (!session?.user) {
       setStatus('error')
@@ -59,7 +58,7 @@ function ShareJoinPage() {
     }
 
     setStatus('ready')
-  }, [session, sessionLoading, event, eventLoading, code, navigate])
+  }, [session, event, eventLoading])
 
   const doJoin = async (force = false) => {
     setStatus('joining')
