@@ -16,7 +16,11 @@ model User {
   role          String    @default("user")
   disabledAt    DateTime?
   streakCount   Int       @default(0)
+  // Presence heartbeat. Written at most once per PRESENCE_WRITE_INTERVAL_MS.
   lastActiveDate DateTime?
+  // Streak bookkeeping lives in its own column so the presence heartbeat can't
+  // clobber the value the streak calculation reads.
+  lastStreakDate DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
@@ -25,6 +29,16 @@ model User {
   blockedUsers      UserBlock[]       @relation("BlockedBy")
   blockingUsers     UserBlock[]       @relation("Blocking")
   badges            UserBadge[]
+  profile           Profile?
+  attendances       EventAttendee[]
+  swipesGiven       EventSwipe[]      @relation("SwipesGiven")
+  swipesReceived    EventSwipe[]      @relation("SwipesReceived")
+  matchesAsUser1    EventMatch[]      @relation("MatchUser1")
+  matchesAsUser2    EventMatch[]      @relation("MatchUser2")
+  messagesSent      EventMessage[]
+  notifications     Notification[]
+  reportsMade       Report[]          @relation("ReportsMade")
+  reportsReceived   Report[]          @relation("ReportsReceived")
 }
 
 model Session {
@@ -37,6 +51,8 @@ model Session {
   userAgent String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([userId])
 }
 
 model Account {
@@ -63,15 +79,20 @@ model Verification {
   identifier String
   value      String
   expiresAt  DateTime
+  // Failed verification attempts against this record. The record is destroyed
+  // once this passes OTP_MAX_ATTEMPTS so a 6-digit code can't be walked.
+  attempts   Int      @default(0)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
   @@unique([identifier, value])
+  @@index([identifier])
 }
 
 model Profile {
   id          String   @id @default(uuid())
   userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   name        String?
   bio         String?
   photos      String[]
@@ -81,7 +102,13 @@ model Profile {
   interests   String[]
   lookingFor  String[] @default([])
   job         String?
+  // Set only by an admin review (server/admin.ts). Users submit a capture,
+  // which lands in the three fields below; they cannot grant themselves the
+  // badge.
   verifiedAt  DateTime?
+  verificationPhoto       String?
+  verificationSubmittedAt DateTime?
+  verificationStatus      String?   // null | 'pending' | 'approved' | 'rejected'
   boostedUntil DateTime?
   lastBoostedAt DateTime?
   discoveryMode String  @default("global") // 'global' | 'event'
@@ -90,6 +117,10 @@ model Profile {
   prefShowMe  String   @default("Everyone") // 'Women' | 'Men' | 'Everyone'
   createdAt   DateTime  @default(now())
   updatedAt   DateTime @updatedAt
+
+  // Global discovery pages over this; boostedUntil orders the first page.
+  @@index([discoveryMode, boostedUntil])
+  @@index([verificationStatus, verificationSubmittedAt])
 }
 
 model PushSubscription {
@@ -153,6 +184,7 @@ model EventAttendee {
   eventId   String
   event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
   userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   joinedAt  DateTime @default(now())
   leftAt    DateTime?
   removedById String?
@@ -160,7 +192,9 @@ model EventAttendee {
 
   @@unique([eventId, userId])
   @@index([userId])
+  @@index([userId, leftAt])
   @@index([eventId, leftAt])
+  @@index([userId, joinedAt])
 }
 
 model EventWaitlist {
@@ -171,6 +205,8 @@ model EventWaitlist {
   joinedAt  DateTime @default(now())
 
   @@unique([eventId, userId])
+  @@index([userId])
+  @@index([eventId, joinedAt])
 }
 
 model EventBlockedUser {
@@ -194,6 +230,13 @@ model EventOrganizerMessage {
   content    String
   createdAt  DateTime @default(now())
   readAt     DateTime?
+
+  // getConversations filters on sender/receiver without an eventId, so each
+  // side needs its own leading-column index.
+  @@index([senderId, createdAt])
+  @@index([receiverId, createdAt])
+  @@index([receiverId, readAt])
+  @@index([eventId, senderId, receiverId, createdAt])
 }
 
 model EventPost {
@@ -212,13 +255,20 @@ model EventSwipe {
   eventId   String?
   event     Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
   swiperId  String
+  swiper    User     @relation("SwipesGiven", fields: [swiperId], references: [id], onDelete: Cascade)
   swipedId  String
+  swiped    User     @relation("SwipesReceived", fields: [swipedId], references: [id], onDelete: Cascade)
   direction String // like | pass | super
   createdAt DateTime @default(now())
 
+  // NOTE: this compound unique does not dedupe rows where eventId IS NULL.
+  // Global swipes are covered by the partial unique index
+  // "EventSwipe_global_swiper_swiped_key" (see 20260909200622_global_discovery).
   @@unique([eventId, swiperId, swipedId])
   @@index([eventId, swipedId, direction])
   @@index([swiperId])
+  @@index([swiperId, eventId])
+  @@index([swipedId, direction])
 }
 
 model EventMatch {
@@ -226,13 +276,19 @@ model EventMatch {
   eventId            String?
   event              Event?          @relation(fields: [eventId], references: [id], onDelete: SetNull)
   user1Id            String
+  user1              User            @relation("MatchUser1", fields: [user1Id], references: [id], onDelete: Cascade)
   user2Id            String
+  user2              User            @relation("MatchUser2", fields: [user2Id], references: [id], onDelete: Cascade)
   createdAt          DateTime        @default(now())
   messagesUnlockedAt DateTime?
   messages           EventMessage[]
 
-  @@index([eventId, user1Id])
-  @@index([eventId, user2Id])
+  // Every read filters `OR [user1Id, user2Id]` with no eventId, so eventId
+  // cannot be the leading column. Uniqueness of the pair is enforced by two
+  // partial unique indexes (event-scoped and global) added in the migration.
+  @@index([user1Id, createdAt])
+  @@index([user2Id, createdAt])
+  @@index([eventId])
 }
 
 model EventMessage {
@@ -240,6 +296,7 @@ model EventMessage {
   matchId   String
   match     EventMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
   senderId  String
+  sender    User       @relation(fields: [senderId], references: [id], onDelete: Cascade)
   type      String     @default("text")
   content   String
   audioUrl  String?
@@ -248,21 +305,34 @@ model EventMessage {
 
   @@index([matchId, createdAt])
   @@index([senderId])
+  // Unread-count groupBy: matchId + "not me" + readAt IS NULL.
+  @@index([matchId, readAt, senderId])
 }
 
 model Report {
   id         String   @id @default(uuid())
   eventId    String?
   reporterId String
+  reporter   User     @relation("ReportsMade", fields: [reporterId], references: [id], onDelete: Cascade)
   reportedId String
+  reported   User     @relation("ReportsReceived", fields: [reportedId], references: [id], onDelete: Cascade)
   reason     String
   status     String   @default("pending")
   createdAt  DateTime @default(now())
+
+  // Auto-moderation groups by reportedId over pending reports in a time window.
+  @@index([reportedId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([reporterId, createdAt])
+  // One report per reporter/target/event. Global reports (eventId IS NULL) are
+  // deduped by a partial unique index added in the migration.
+  @@unique([reporterId, reportedId, eventId])
 }
 
 model Notification {
   id        String   @id @default(uuid())
   userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   type      String   // like | match | message | organizer_message | request | request_accepted
   title     String
   body      String
@@ -285,12 +355,6 @@ model UserBadge {
   @@index([userId])
 }
 
-model Todo {
-  id        String   @id @default(uuid())
-  title     String
-  createdAt DateTime @default(now())
-}
-
 model EventMessageRequest {
   id         String   @id @default(uuid())
   eventId    String?
@@ -300,6 +364,10 @@ model EventMessageRequest {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
+  // Global requests (eventId IS NULL) are deduped by a partial unique index
+  // added in the migration, for the same NULL-distinct reason as EventSwipe.
   @@unique([eventId, senderId, receiverId])
+  @@index([receiverId, status, createdAt])
+  @@index([senderId, status, createdAt])
 }
 
