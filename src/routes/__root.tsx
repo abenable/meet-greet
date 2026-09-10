@@ -71,10 +71,16 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
     const isPublic = isPublicPath(location.pathname)
 
     let session: Awaited<ReturnType<typeof getSession>> = null
+    let sessionKnown = true
     try {
       session = await getSession()
     } catch {
-      // If session fetch fails, treat as unauthenticated
+      // The lookup failed — that is not the same as being signed out, and
+      // treating it as such is what bounced signed-in users to /login on a
+      // click. Let the navigation through; every server function behind this
+      // page still calls requireSession(), so nothing is exposed by guessing
+      // optimistically here.
+      sessionKnown = false
     }
 
     const isVerified = !!session?.user?.emailVerified
@@ -87,6 +93,7 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
     }
 
     if (!session?.session) {
+      if (!sessionKnown) return { session: null }
       throw redirect({ to: '/login' })
     }
 

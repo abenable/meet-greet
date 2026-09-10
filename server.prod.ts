@@ -4,6 +4,8 @@ import './dist/server/instrument.server.mjs'
 import { stat } from 'fs/promises'
 import { join, normalize, resolve, sep } from 'path'
 
+import { CLIENT_IP_HEADER, parseTrustedHops, resolveClientIp } from './src/lib/client-ip'
+
 // Validate required environment variables
 const requiredEnvVars = ['DATABASE_URL', 'BETTER_AUTH_SECRET', 'BETTER_AUTH_URL']
 const missingVars = requiredEnvVars.filter(v => !process.env[v])
@@ -16,11 +18,16 @@ console.log('✅ Environment variables validated')
 // @ts-ignore - built output, not present at type-check time
 import serverEntry from './dist/server/server.js'
 
-// NOTE: nothing here imports from ./src directly. Those modules use the `#/*`
-// alias, which Vite resolves at build time via tsconfig paths — but Node's
-// subpath-imports spec rejects keys starting with `#/`, so Bun >= 1.4.2 cannot
-// resolve them at runtime. Everything this server needs from the app goes
-// through the bundled handler in dist/, via serverEntry.fetch().
+// NOTE: this server pulls almost nothing from ./src. Those modules use the
+// `#/*` alias, which Vite resolves at build time via tsconfig paths — but
+// Node's subpath-imports spec rejects keys starting with `#/`, so Bun >= 1.4.2
+// cannot resolve them at runtime. Everything this server needs from the app
+// goes through the bundled handler in dist/, via serverEntry.fetch().
+//
+// The one exception is ./src/lib/client-ip, imported relatively below. It is a
+// leaf module with zero imports of its own, so Bun resolves it fine, and the
+// alternative — restating the TRUST_PROXY hop rules here — means two copies of
+// a security decision that must agree. Keep that module dependency-free.
 
 const port = Number(process.env.PORT) || 3000
 const clientDir = './dist/client'
@@ -30,22 +37,40 @@ const clientDir = './dist/client'
 const publicOrigin = process.env.BETTER_AUTH_URL || `http://127.0.0.1:${port}`
 
 /**
- * Header carrying the peer address, set by this server on every request.
+ * Resolve the client address once, here, and hand it to the app in
+ * CLIENT_IP_HEADER.
  *
  * A Bun `Request` exposes no socket, so the app layer cannot see the client
  * address on its own — without this, getClientIdentifier() falls back to a
  * single shared bucket and every user shares one rate limit, which turns the
  * OTP limiter into an app-wide denial of service.
  *
+ * The socket address is only the right answer when we face the internet
+ * directly. Behind a reverse proxy it *is* the proxy, which collapses every
+ * user into one bucket just as badly — so when TRUST_PROXY says a proxy we
+ * control is in front, the address comes from the hop it appended instead.
+ *
  * Any inbound value is stripped first, so a client cannot forge it.
  */
-const CLIENT_IP_HEADER = 'x-mag-client-ip'
+const trustedHops = parseTrustedHops(process.env.TRUST_PROXY)
+
+if (trustedHops === 0 && process.env.NODE_ENV === 'production') {
+  console.warn(
+    '[server] TRUST_PROXY is unset. If this process sits behind a reverse proxy ' +
+      'or load balancer, every request will look like it came from the proxy and ' +
+      'all users will share one rate-limit bucket. Set TRUST_PROXY to the number ' +
+      'of proxy hops (1 for a single nginx/Caddy/Cloudflare/ALB in front).',
+  )
+}
 
 function withClientIp(request: Request, server: any): Request {
   const headers = new Headers(request.headers)
   headers.delete(CLIENT_IP_HEADER)
 
-  const address = server.requestIP?.(request)?.address
+  const address = resolveClientIp(request.headers, {
+    peerAddress: server.requestIP?.(request)?.address ?? null,
+    trustedHops,
+  })
   if (address) headers.set(CLIENT_IP_HEADER, address)
 
   return new Request(request, { headers })

@@ -8,6 +8,9 @@ import { prisma } from '#/db'
 import { sendOtpEmail } from '#/lib/email'
 import { rateLimit } from '#/lib/rate-limit'
 import { getClientIdentifier } from '#/lib/rate-limit.server'
+import { readSessionResponse } from '#/lib/session-response'
+import { SessionCache, resolveSessionCacheTtlMs } from '#/server/session-cache'
+import { getSessionCookie } from 'better-auth/cookies'
 
 /** Codes die after 10 minutes or OTP_MAX_ATTEMPTS wrong guesses, whichever first. */
 const OTP_TTL_MS = 10 * 60 * 1000
@@ -41,13 +44,68 @@ export interface AppSession {
  * Per-request memoization.
  *
  * Resolving a session costs a synthetic request through better-auth's handler
- * (one session query) plus a user lookup and a profile lookup. Every server
- * function calls requireSession(), and the root route calls getSession() on
- * every navigation, so without this a single page load repeats that work a
- * dozen times. The cache is keyed on the request object itself and dies with
- * it, so it can never leak one user's session into another's request.
+ * (one session query) plus a user lookup and a profile lookup. The cache is
+ * keyed on the request object itself and dies with it, so it can never leak one
+ * user's session into another's request.
+ *
+ * This only collapses repeats *within* one request, which is less than it
+ * sounds: every server function arrives as its own HTTP request, so a single
+ * navigation still paid for the work ten-plus times. tokenCache below is what
+ * fixes that.
  */
 const sessionCache = new WeakMap<Request, Promise<AppSession | null>>()
+
+/**
+ * Cross-request cache, keyed on the session token from the cookie. Short TTL;
+ * see server/session-cache.ts for the revocation trade-off, and call
+ * invalidateSessionsForUser() from anywhere that changes what a session means.
+ */
+const tokenCache = new SessionCache<AppSession>(resolveSessionCacheTtlMs())
+
+/** Drop every cached session for a user. Safe to call when nothing is cached. */
+export function invalidateSessionsForUser(userId: string): void {
+  tokenCache.invalidateUser(userId)
+}
+
+/**
+ * Flush the cache after better-auth itself mutated something — sign-out,
+ * revoke-session, change-password and friends all go through its own handler,
+ * where none of the call sites above can see them.
+ *
+ * Signing out also clears the cookie, so the next request has no token and
+ * resolves to null regardless. This matters for the cases that revoke a session
+ * the *caller* isn't using: when the token is one we hold, we know the user it
+ * belongs to without a query, so flush all of their sessions rather than just
+ * the one.
+ */
+export function invalidateSessionsAfterAuthMutation(token: string | null): void {
+  if (!token) return
+  const userId = tokenCache.userIdFor(token)
+  if (userId) tokenCache.invalidateUser(userId)
+  else tokenCache.deleteToken(token)
+}
+
+/**
+ * Read the better-auth session token off a request, or null if there isn't one.
+ * Used only as a cache key: if the cookie name ever drifts from what
+ * getSessionCookie expects, this returns null and we simply stop caching rather
+ * than mistaking a signed-in caller for an anonymous one.
+ */
+export function sessionTokenFor(request: Request): string | null {
+  try {
+    return getSessionCookie(request)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Callers get their own copy, so a mutation downstream cannot corrupt the entry
+ * every later request will be served.
+ */
+function copySession(session: AppSession): AppSession {
+  return { ...session, user: { ...session.user } }
+}
 
 function generateOtp(): string {
   // randomInt is CSPRNG-backed; Math.random is not, and a predictable
@@ -67,6 +125,12 @@ async function resolveSession(): Promise<AppSession | null> {
   const request = getRequest()
   const url = getRequestUrl()
 
+  const token = sessionTokenFor(request)
+  if (token) {
+    const hit = tokenCache.get(token)
+    if (hit) return copySession(hit)
+  }
+
   // Build a synthetic GET request to better-auth's /get-session endpoint
   const sessionReq = new Request(new URL('/api/auth/get-session', url.origin), {
     method: 'GET',
@@ -74,10 +138,12 @@ async function resolveSession(): Promise<AppSession | null> {
   })
 
   const response = await auth.handler(sessionReq)
-  if (!response.ok) return null
 
-  const data = await response.json()
-  if (!data || !data.session || !data.user?.id) return null
+  // Throws when the lookup *failed* (429, 5xx) rather than reporting it as an
+  // absent session — see lib/session-response.ts for why that distinction
+  // matters.
+  const data = await readSessionResponse(response)
+  if (!data) return null
 
   const [user, profile] = await Promise.all([
     prisma.user.findUnique({
@@ -98,7 +164,9 @@ async function resolveSession(): Promise<AppSession | null> {
   const profilePhoto = profile?.photos && profile.photos.length > 0 ? profile.photos[0] : null
   data.user.image = profilePhoto ?? user.image ?? data.user.image ?? null
 
-  return data as AppSession
+  const session = data as unknown as AppSession
+  if (token) tokenCache.set(token, session.user.id, session)
+  return copySession(session)
 }
 
 function fetchSessionFromAuthHandler(): Promise<AppSession | null> {
@@ -115,13 +183,17 @@ function fetchSessionFromAuthHandler(): Promise<AppSession | null> {
   return pending
 }
 
+/**
+ * Resolves the caller's session, or null if there isn't one.
+ *
+ * Note that this rejects when the lookup *fails*, rather than reporting a
+ * failure as a null session. Callers that route on the result — the root
+ * beforeLoad, the login screen — must not send a signed-in user to /login or
+ * back through OTP just because one request didn't come back.
+ */
 export const getSession = createServerFn({ method: 'GET' })
   .handler(async () => {
-    try {
-      return await fetchSessionFromAuthHandler()
-    } catch {
-      return null
-    }
+    return await fetchSessionFromAuthHandler()
   })
 
 /**
@@ -168,6 +240,8 @@ export const disableMyAccount = createServerFn({ method: 'POST' })
         where: { userId },
       }),
     ])
+
+    invalidateSessionsForUser(userId)
 
     return { success: true }
   })
@@ -259,10 +333,14 @@ export const verifyEmailOtp = createServerFn({ method: 'POST' })
       return { valid: false as const, message: 'Invalid or expired code.' }
     }
 
-    await prisma.user.update({
+    const verified = await prisma.user.update({
       where: { email: data.email },
       data: { emailVerified: true },
     })
+
+    // Any session cached before this moment still says "unverified", which
+    // would bounce the user straight back to the screen they just cleared.
+    invalidateSessionsForUser(verified.id)
 
     await prisma.verification.delete({ where: { id: record.id } }).catch(() => {})
 
@@ -362,6 +440,10 @@ export const resetPasswordWithOtp = createServerFn({ method: 'POST' })
       await tx.session.deleteMany({ where: { userId: user.id } })
       await tx.verification.delete({ where: { id: record.id } })
     })
+
+    // The whole point of the deleteMany above is that a stolen session stops
+    // working now, not in a few seconds.
+    invalidateSessionsForUser(user.id)
 
     return { success: true as const }
   })
