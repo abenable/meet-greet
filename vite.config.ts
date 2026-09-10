@@ -5,7 +5,6 @@ import { tanstackStart } from '@tanstack/react-start/plugin/vite'
 
 import viteReact from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { VitePWA } from 'vite-plugin-pwa'
 import { devWebSocketPlugin } from './dev-ws-plugin'
 
 const config = defineConfig({
@@ -16,77 +15,17 @@ const config = defineConfig({
     tanstackStart(),
     viteReact(),
     devWebSocketPlugin(),
-    VitePWA({
-      registerType: 'autoUpdate',
-      injectRegister: false,
-      workbox: {
-        globPatterns: ['**/*.{js,css,svg,png,ico,woff2}'],
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'google-fonts-cache',
-              expiration: {
-                maxEntries: 10,
-                maxAgeSeconds: 60 * 60 * 24 * 365,
-              },
-              cacheableResponse: {
-                statuses: [0, 200],
-              },
-            },
-          },
-          {
-            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'gstatic-fonts-cache',
-              expiration: {
-                maxEntries: 10,
-                maxAgeSeconds: 60 * 60 * 24 * 365,
-              },
-              cacheableResponse: {
-                statuses: [0, 200],
-              },
-            },
-          },
-          {
-            urlPattern: /\/api\/(?!auth\/).*$/i,
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'api-cache',
-              expiration: {
-                maxEntries: 100,
-                maxAgeSeconds: 60 * 60 * 24,
-              },
-              networkTimeoutSeconds: 10,
-              cacheableResponse: {
-                statuses: [0, 200],
-              },
-            },
-          },
-          {
-            urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp)$/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'images-cache',
-              expiration: {
-                maxEntries: 60,
-                maxAgeSeconds: 60 * 60 * 24 * 30,
-              },
-              cacheableResponse: {
-                statuses: [0, 200],
-              },
-            },
-          },
-        ],
-        cleanupOutdatedCaches: true,
-      },
-      devOptions: {
-        enabled: false,
-        type: 'module',
-      },
-    }),
+    // VitePWA has been removed rather than reconfigured.
+    //
+    // Its generateSW output was never used: public/sw.js is copied into
+    // dist/client and overwrote the generated worker, so the precache manifest
+    // and all four runtimeCaching rules configured here were dead code. Its
+    // injectManifest mode emits nothing under TanStack Start's
+    // multi-environment build, so there was no working migration path either.
+    //
+    // public/sw.js is now the single service worker: push handling plus a
+    // conservative same-origin asset cache. The manifest the app actually
+    // links to is public/manifest.json.
   ],
 })
 

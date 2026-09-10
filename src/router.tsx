@@ -12,7 +12,10 @@ export function getRouter() {
     context,
     scrollRestoration: true,
     defaultPreload: 'intent',
-    defaultPreloadStaleTime: 0,
+    // Was 0, which made every hover re-run the target route's loaders in full.
+    // 30s matches the query client's staleTime so a preload and a subsequent
+    // navigation share one fetch.
+    defaultPreloadStaleTime: 30_000,
   })
 
   setupRouterSsrQueryIntegration({ router, queryClient: context.queryClient })
