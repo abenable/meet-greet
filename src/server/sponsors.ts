@@ -32,6 +32,8 @@ export const updateEventSponsor = createServerFn({ method: 'POST' })
 export const getEventSponsor = createServerFn({ method: 'GET' })
   .inputValidator(z.string())
   .handler(async ({ data: eventId }) => {
+    await requireSession()
+
     const event = await prisma.event.findUnique({
       where: { id: eventId },
       select: { sponsorName: true, sponsorLogo: true, sponsorFrameUrl: true },

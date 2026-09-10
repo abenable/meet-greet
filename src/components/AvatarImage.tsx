@@ -5,6 +5,11 @@ interface AvatarImageProps {
   alt?: string
   className?: string
   imgClassName?: string
+  /**
+   * Set on the one image that's on screen at load (the top card, the chat
+   * header) so it isn't deferred behind lazy loading.
+   */
+  priority?: boolean
 }
 
 export default function AvatarImage({
@@ -12,6 +17,7 @@ export default function AvatarImage({
   alt = '',
   className = '',
   imgClassName = '',
+  priority = false,
 }: AvatarImageProps) {
   const hasImage = Boolean(src && src.trim())
 
@@ -20,6 +26,12 @@ export default function AvatarImage({
       <img
         src={src!}
         alt={alt}
+        // Photos are full-bleed profile images from R2. Without lazy loading,
+        // every card in a rendered deck fetched its image immediately.
+        loading={priority ? 'eager' : 'lazy'}
+        decoding="async"
+        fetchPriority={priority ? 'high' : 'auto'}
+        draggable={false}
         className={`h-full w-full object-cover ${imgClassName}`.trim()}
       />
     )

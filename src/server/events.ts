@@ -1,20 +1,68 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
+import { randomBytes } from 'node:crypto'
 import { PutObjectCommand } from '@aws-sdk/client-s3'
+import { Prisma } from '@prisma/client'
 import { prisma } from '#/db'
 import { requireSession } from '#/server/auth'
 import { broadcastToEvent } from '#/server/websocket-broadcast'
 import { r2Client, R2_BUCKET_NAME, R2_PUBLIC_URL } from '#/lib/r2'
+import { rateLimit } from '#/lib/rate-limit'
+import { sanitizeText } from '#/lib/sanitize'
 import { awardBadgeIfNotExists } from './badges.server'
 import type { Profile } from '@prisma/client'
 
+/** Reports are an abuse vector in both directions; cap how fast they arrive. */
+const reportRateLimit = rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 10 })
+/** Creating events writes rows and allocates R2 keys. */
+const createEventRateLimit = rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 10 })
+/** Posting to an event feed. */
+const eventPostRateLimit = rateLimit({ windowMs: 60 * 1000, maxRequests: 20 })
+
+const MAX_BASE64_LENGTH = 15_000_000 // ~10MB JPEG after encoding
+
+/** Hard cap on how many candidates a single deck request will consider. */
+const DECK_CANDIDATE_LIMIT = 400
+/** How many profiles a single deck response returns. */
+const DECK_PAGE_SIZE = 30
+
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const CODE_LENGTH = 8
+
+/**
+ * Event codes double as an access control for private events, so they are
+ * drawn from a CSPRNG rather than Math.random and widened from 6 to 8
+ * characters (32^8 ≈ 1.1e12 instead of 32^6 ≈ 1.1e9).
+ */
 function generateCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const bytes = randomBytes(CODE_LENGTH)
   let code = ''
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length))
+  for (let i = 0; i < CODE_LENGTH; i++) {
+    code += CODE_ALPHABET[bytes[i]! % CODE_ALPHABET.length]
   }
   return code
+}
+
+/**
+ * Create the event, retrying on the (astronomically unlikely) unique-code
+ * collision that previously surfaced as an unhandled 500.
+ */
+async function createEventWithUniqueCode(
+  tx: Prisma.TransactionClient,
+  data: Omit<Prisma.EventUncheckedCreateInput, 'code'>,
+) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await tx.event.create({ data: { ...data, code: generateCode() } })
+    } catch (err) {
+      const isCodeCollision =
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002' &&
+        String((err.meta as { target?: string[] } | undefined)?.target ?? '').includes('code')
+      if (!isCodeCollision) throw err
+    }
+  }
+  throw new Error('Could not allocate an event code. Please try again.')
 }
 
 function seededShuffle<T>(arr: T[], seed: string): T[] {
@@ -52,20 +100,31 @@ function calculateAge(birthDate: string | null | undefined): number | null {
   return age
 }
 
-async function getFlaggedUserIds(): Promise<string[]> {
-  // Auto-moderation filter: users with >= 2 pending reports in the last 24h
-  // are effectively shadow-banned from discovery and attendee lists
-  const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
-  const flagged = await prisma.report.groupBy({
-    by: ['reportedId'],
-    where: {
-      status: 'pending',
-      createdAt: { gte: twentyFourHoursAgo },
-    },
-    _count: { id: true },
-    having: { id: { _count: { gte: 2 } } },
-  })
-  return flagged.map((f) => f.reportedId)
+/** Distinct reporters required before auto-moderation hides someone. */
+export const FLAG_THRESHOLD = 3
+const FLAG_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Auto-moderation filter: users reported by at least FLAG_THRESHOLD *distinct*
+ * reporters in the last 24h are hidden from discovery and attendee lists.
+ *
+ * Counting rows rather than distinct reporters let a single account hide any
+ * user by filing two reports. A unique index on (reporterId, reportedId,
+ * eventId) now prevents the duplicates at write time, and this query counts
+ * distinct reporters so the threshold means what it says either way.
+ */
+async function getFlaggedUserIds(): Promise<Set<string>> {
+  const since = new Date(Date.now() - FLAG_WINDOW_MS)
+
+  const rows = await prisma.$queryRaw<Array<{ reportedId: string }>>`
+    SELECT "reportedId"
+    FROM "Report"
+    WHERE "status" = 'pending' AND "createdAt" >= ${since}
+    GROUP BY "reportedId"
+    HAVING COUNT(DISTINCT "reporterId") >= ${FLAG_THRESHOLD}
+  `
+
+  return new Set(rows.map((r) => r.reportedId))
 }
 
 export const listEvents = createServerFn({ method: 'GET' })
@@ -78,7 +137,12 @@ export const listEvents = createServerFn({ method: 'GET' })
     const cursor = data?.cursor
 
     return prisma.event.findMany({
-      where: { isPublic: true },
+      // Ended and deactivated events were still being listed publicly.
+      where: {
+        isPublic: true,
+        isActive: true,
+        OR: [{ endedAt: null }, { endedAt: { gt: new Date() } }],
+      },
       select: {
         id: true,
         name: true,
@@ -94,7 +158,9 @@ export const listEvents = createServerFn({ method: 'GET' })
         sponsorFrameUrl: true,
         _count: { select: { attendees: { where: { leftAt: null } } } },
       },
-      orderBy: { createdAt: 'desc' },
+      // id as a tiebreaker: cursor pagination on a non-unique ordering
+      // key can skip or repeat rows when timestamps collide.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor && { cursor: { id: cursor }, skip: 1 }),
     }).then(events => {
@@ -123,7 +189,7 @@ export const getEventByCode = createServerFn({ method: 'GET' })
     if (!event.isActive) return null
     if (event.endedAt && event.endedAt <= now) return null
 
-    await promoteWaitlist(event.id)
+    await maybePromoteWaitlist(event.id)
 
     // Re-fetch to get updated count after promotion
     return prisma.event.findUnique({
@@ -139,7 +205,7 @@ export const getEventById = createServerFn({ method: 'GET' })
   .handler(async ({ data: id }) => {
     const session = await requireSession()
 
-    await promoteWaitlist(id)
+    await maybePromoteWaitlist(id)
 
     const event = await prisma.event.findUnique({
       where: { id },
@@ -151,12 +217,30 @@ export const getEventById = createServerFn({ method: 'GET' })
     if (!event) return null
 
     const isCreator = event.createdById === session.user.id
-    if (!isCreator) {
-      const { code, ...rest } = event
-      return rest
+    if (isCreator) return event
+
+    // A private event is only visible to people who are actually connected to
+    // it. Previously any signed-in user who knew (or guessed) an id got the
+    // full record back minus the join code.
+    if (!event.isPublic) {
+      const [attendee, waitlisted] = await Promise.all([
+        // leftAt: null — a former attendee, or one the organizer removed,
+        // keeps their row, so an unfiltered lookup would let them keep reading
+        // a private event after being removed from it.
+        prisma.eventAttendee.findFirst({
+          where: { eventId: id, userId: session.user.id, leftAt: null },
+          select: { id: true },
+        }),
+        prisma.eventWaitlist.findUnique({
+          where: { eventId_userId: { eventId: id, userId: session.user.id } },
+          select: { id: true },
+        }),
+      ])
+      if (!attendee && !waitlisted) return null
     }
 
-    return event
+    const { code, ...rest } = event
+    return rest
   })
 
 async function leaveAllActiveEvents(userId: string, tx?: any) {
@@ -175,38 +259,49 @@ async function getCurrentActiveEvent(userId: string) {
   return attendee?.event ?? null
 }
 
+/**
+ * Move waitlisted users into the event, up to remaining capacity.
+ *
+ * Two things changed here. First, capacity is now read *inside* a transaction
+ * that holds a row lock on the event, so two concurrent promotions can no
+ * longer both see the same free slots and push the event over maxAttendees.
+ * Second, this is no longer called from read handlers — see
+ * maybePromoteWaitlist() for the throttled entry point used by GET paths.
+ */
 async function promoteWaitlist(eventId: string) {
-  const event = await prisma.event.findUnique({
-    where: { id: eventId },
-    include: {
-      _count: { select: { attendees: { where: { leftAt: null } } } },
-    },
-  })
-  if (!event) return
-  if (event.endedAt && event.endedAt <= new Date()) return
-
-  const hasStarted = !event.startsAt || event.startsAt <= new Date()
-  if (!hasStarted) return
-
-  const waitlist = await prisma.eventWaitlist.findMany({
-    where: { eventId },
-    orderBy: { joinedAt: 'asc' },
-  })
-  if (waitlist.length === 0) return
-
-  const slotsAvailable =
-    event.maxAttendees === null
-      ? Infinity
-      : event.maxAttendees - event._count.attendees
-  if (slotsAvailable <= 0) return
-
-  const toPromote = waitlist.slice(
-    0,
-    slotsAvailable === Infinity ? undefined : slotsAvailable
-  )
-  const userIds = toPromote.map((w) => w.userId)
-
   await prisma.$transaction(async (tx) => {
+    // SELECT ... FOR UPDATE serialises promotion for this event.
+    const locked = await tx.$queryRaw<Array<{ id: string; maxAttendees: number | null; startsAt: Date | null; endedAt: Date | null }>>`
+      SELECT "id", "maxAttendees", "startsAt", "endedAt"
+      FROM "Event"
+      WHERE "id" = ${eventId}
+      FOR UPDATE
+    `
+    const event = locked[0]
+    if (!event) return
+
+    const now = new Date()
+    if (event.endedAt && event.endedAt <= now) return
+    if (event.startsAt && event.startsAt > now) return
+
+    const activeCount = await tx.eventAttendee.count({
+      where: { eventId, leftAt: null },
+    })
+
+    const slotsAvailable =
+      event.maxAttendees === null ? Number.MAX_SAFE_INTEGER : event.maxAttendees - activeCount
+    if (slotsAvailable <= 0) return
+
+    const toPromote = await tx.eventWaitlist.findMany({
+      where: { eventId },
+      orderBy: { joinedAt: 'asc' },
+      take: Math.min(slotsAvailable, 500),
+      select: { id: true, userId: true },
+    })
+    if (toPromote.length === 0) return
+
+    const userIds = toPromote.map((w) => w.userId)
+
     await tx.eventAttendee.updateMany({
       where: { eventId, userId: { in: userIds } },
       data: { leftAt: null, removedById: null, removedAt: null },
@@ -219,6 +314,35 @@ async function promoteWaitlist(eventId: string) {
       where: { id: { in: toPromote.map((w) => w.id) } },
     })
   })
+}
+
+/**
+ * Read handlers used to run the full promotion transaction on every call,
+ * turning a page view into a write storm. This throttles promotion to at most
+ * once per event per interval, and swallows failures so a read never 500s
+ * because of housekeeping.
+ */
+const PROMOTE_THROTTLE_MS = 30_000
+const lastPromotedAt = new Map<string, number>()
+
+async function maybePromoteWaitlist(eventId: string) {
+  const now = Date.now()
+  const last = lastPromotedAt.get(eventId) ?? 0
+  if (now - last < PROMOTE_THROTTLE_MS) return
+  lastPromotedAt.set(eventId, now)
+
+  // Keep the throttle map from growing without bound on a long-lived process.
+  if (lastPromotedAt.size > 10_000) {
+    for (const [key, at] of lastPromotedAt) {
+      if (now - at > PROMOTE_THROTTLE_MS) lastPromotedAt.delete(key)
+    }
+  }
+
+  try {
+    await promoteWaitlist(eventId)
+  } catch (err) {
+    console.warn('[waitlist] promotion failed for', eventId, err)
+  }
 }
 
 export const createEvent = createServerFn({ method: 'POST' })
@@ -239,6 +363,11 @@ export const createEvent = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const session = await requireSession()
 
+    const throttle = await createEventRateLimit(`create-event:${session.user.id}`)
+    if (!throttle.success) {
+      return { success: false as const, message: 'You are creating events too quickly. Try again later.' }
+    }
+
     if (!data.force) {
       const currentEvent = await getCurrentActiveEvent(session.user.id)
       if (currentEvent) {
@@ -247,26 +376,26 @@ export const createEvent = createServerFn({ method: 'POST' })
     }
 
     const photoIsBase64 = data.photo && data.photo.startsWith('data:image')
+    if (photoIsBase64 && data.photo!.length > MAX_BASE64_LENGTH) {
+      return { success: false as const, message: 'Event photo is too large.' }
+    }
 
     const event = await prisma.$transaction(async (tx) => {
       await leaveAllActiveEvents(session.user.id, tx)
 
-      const event = await tx.event.create({
-        data: {
-          code: generateCode(),
-          name: data.name,
-          photo: photoIsBase64 ? null : data.photo ?? null,
-          description: data.description,
-          location: data.location,
-          maxAttendees: data.maxAttendees,
-          startsAt: data.startsAt ? new Date(data.startsAt) : null,
-          createdById: session.user.id,
-          isPublic: data.isPublic ?? true,
-          mysteryMode: data.mysteryMode ?? false,
-          sponsorName: data.sponsorName,
-          sponsorLogo: data.sponsorLogo,
-          sponsorFrameUrl: data.sponsorFrameUrl,
-        },
+      const event = await createEventWithUniqueCode(tx, {
+        name: sanitizeText(data.name),
+        photo: photoIsBase64 ? null : data.photo ?? null,
+        description: data.description ? sanitizeText(data.description) : undefined,
+        location: data.location ? sanitizeText(data.location) : undefined,
+        maxAttendees: data.maxAttendees,
+        startsAt: data.startsAt ? new Date(data.startsAt) : null,
+        createdById: session.user.id,
+        isPublic: data.isPublic ?? true,
+        mysteryMode: data.mysteryMode ?? false,
+        sponsorName: data.sponsorName ? sanitizeText(data.sponsorName) : undefined,
+        sponsorLogo: data.sponsorLogo,
+        sponsorFrameUrl: data.sponsorFrameUrl,
       })
       await tx.eventAttendee.create({
         data: { eventId: event.id, userId: session.user.id },
@@ -367,17 +496,6 @@ export const joinEvent = createServerFn({ method: 'POST' })
       return { success: true, waitlisted: true }
     }
 
-    // Check capacity after promotion
-    const freshEvent = await prisma.event.findUnique({
-      where: { id: event.id },
-      include: {
-        _count: { select: { attendees: { where: { leftAt: null } } } },
-      },
-    })
-    if (freshEvent && freshEvent.maxAttendees !== null && freshEvent._count.attendees >= freshEvent.maxAttendees) {
-      return { success: false, message: 'Event is full' }
-    }
-
     if (!data.force) {
       const currentEvent = await getCurrentActiveEvent(session.user.id)
       if (currentEvent && currentEvent.id !== event.id) {
@@ -385,7 +503,22 @@ export const joinEvent = createServerFn({ method: 'POST' })
       }
     }
 
-    await prisma.$transaction(async (tx) => {
+    // Capacity is checked inside the same transaction that writes the
+    // attendee row, under a row lock on the event. Reading the count outside
+    // the transaction let two concurrent joins both see the last free slot.
+    const joined = await prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ maxAttendees: number | null }>>`
+        SELECT "maxAttendees" FROM "Event" WHERE "id" = ${event.id} FOR UPDATE
+      `
+      const maxAttendees = locked[0]?.maxAttendees ?? null
+
+      if (maxAttendees !== null) {
+        const activeCount = await tx.eventAttendee.count({
+          where: { eventId: event.id, leftAt: null },
+        })
+        if (activeCount >= maxAttendees) return false
+      }
+
       await leaveAllActiveEvents(session.user.id, tx)
 
       await tx.eventAttendee.upsert({
@@ -395,19 +528,40 @@ export const joinEvent = createServerFn({ method: 'POST' })
         update: { leftAt: null, removedById: null, removedAt: null },
         create: { eventId: event.id, userId: session.user.id },
       })
+
+      // They're in; drop any waitlist entry for this event.
+      await tx.eventWaitlist.deleteMany({
+        where: { eventId: event.id, userId: session.user.id },
+      })
+
+      return true
     })
 
-    // Check if user has joined 3+ events and award social_butterfly badge
-    const totalJoinedEvents = await prisma.eventAttendee.count({
-      where: { 
-        userId: session.user.id, 
-        leftAt: null,
-        createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
-      },
-    })
-    if (totalJoinedEvents >= 3) {
-      const { awardBadgeIfNotExists } = await import('./badges.server')
-      await awardBadgeIfNotExists(session.user.id, 'social_butterfly')
+    if (!joined) {
+      return { success: false, message: 'Event is full' }
+    }
+
+    // Award social_butterfly after 3 events in the last 30 days.
+    //
+    // NOTE: this filtered on `createdAt`, which EventAttendee does not have —
+    // Prisma rejected the query at runtime *after* the join had committed, so
+    // every join reported failure. TypeScript does not catch this: Prisma's
+    // Subset<> helper only excess-checks the top level of the argument object,
+    // so unknown keys nested inside `where` compile fine.
+    try {
+      const totalJoinedEvents = await prisma.eventAttendee.count({
+        where: {
+          userId: session.user.id,
+          leftAt: null,
+          joinedAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+        },
+      })
+      if (totalJoinedEvents >= 3) {
+        await awardBadgeIfNotExists(session.user.id, 'social_butterfly')
+      }
+    } catch (err) {
+      // Badge accounting must never fail the join itself.
+      console.warn('[badges] social_butterfly check failed:', err)
     }
 
     return { success: true }
@@ -418,16 +572,18 @@ export const leaveEvent = createServerFn({ method: 'POST' })
   .handler(async ({ data: eventId }) => {
     const session = await requireSession()
 
-    await prisma.eventAttendee.update({
-      where: {
-        eventId_userId: { eventId, userId: session.user.id },
-      },
+    // updateMany, not update: leaving an event you were never in should be a
+    // no-op, not a P2025 that surfaces as a 500.
+    await prisma.eventAttendee.updateMany({
+      where: { eventId, userId: session.user.id, leftAt: null },
       data: { leftAt: new Date() },
     })
 
     await prisma.eventWaitlist.deleteMany({
       where: { eventId, userId: session.user.id },
     })
+
+    return { success: true }
   })
 
 export const getMyCreatedEvents = createServerFn({ method: 'GET' })
@@ -527,7 +683,7 @@ export const getMyActiveEvent = createServerFn({ method: 'GET' })
       where: { userId: session.user.id },
       select: { eventId: true },
     })
-    await Promise.all(waitlisted.map((w) => promoteWaitlist(w.eventId)))
+    await Promise.all(waitlisted.map((w) => maybePromoteWaitlist(w.eventId)))
 
     const attendee = await prisma.eventAttendee.findFirst({
       where: { userId: session.user.id, leftAt: null },
@@ -543,240 +699,252 @@ export const getMyActiveEvent = createServerFn({ method: 'GET' })
     return attendee?.event ?? null
   })
 
+const DECK_PROFILE_SELECT = {
+  id: true,
+  userId: true,
+  name: true,
+  bio: true,
+  photos: true,
+  gender: true,
+  birthDate: true,
+  location: true,
+  interests: true,
+  lookingFor: true,
+  job: true,
+  verifiedAt: true,
+  boostedUntil: true,
+  createdAt: true,
+  updatedAt: true,
+  user: {
+    select: { name: true, image: true, email: true, lastActiveDate: true },
+  },
+} satisfies Prisma.ProfileSelect
+
+export interface DeckProfile {
+  id: string
+  userId: string
+  name: string
+  bio: string | null
+  photos: string[]
+  gender: string | null
+  birthDate: string | null
+  location: string | null
+  interests: string[]
+  lookingFor: string[]
+  job: string | null
+  verifiedAt: Date | null
+  boostedUntil: Date | null
+  createdAt: Date
+  updatedAt: Date
+  isBoosted: boolean
+  sharedInterests: string[]
+  lastActiveDate: Date | null
+}
+
+export interface SwipeDeckPage {
+  items: DeckProfile[]
+  nextOffset: number | null
+}
+
+/**
+ * Build one page of the swipe deck.
+ *
+ * Every exclusion that can be expressed in SQL now is: already-swiped, blocked
+ * in either direction, disabled accounts, shadow-banned accounts, discovery
+ * mode, gender preference and intent. The previous implementation pulled every
+ * candidate profile in the database into memory and filtered with
+ * `Array.includes` inside `.filter`, which is quadratic — a 50k pool against a
+ * 10k swipe history was ~500M comparisons on the event loop, per request.
+ *
+ * Only the age filter stays in JS, because birthDate is stored as a free-form
+ * string and cannot be compared reliably in SQL. It runs over at most
+ * DECK_CANDIDATE_LIMIT rows.
+ */
 async function buildSwipeDeck({
   myUserId,
-  candidateUserIds,
+  candidateWhere,
   swipeHistoryEventId,
   intent,
+  offset,
+  limit,
 }: {
   myUserId: string
-  candidateUserIds: string[]
+  candidateWhere: Prisma.ProfileWhereInput
   swipeHistoryEventId: string | null
   intent?: 'dating' | 'friends' | 'networking'
-}) {
-  const userIds = candidateUserIds.filter((id) => id !== myUserId)
-
-  if (userIds.length === 0) return []
-
-  // Exclude people the current user has already swiped on (passed or liked)
-  const mySwipes = await prisma.eventSwipe.findMany({
-    where: { eventId: swipeHistoryEventId, swiperId: myUserId },
-    select: { swipedId: true, direction: true },
-  })
-  const swipedIds = mySwipes.map((s) => s.swipedId)
-  const visibleUserIds = userIds.filter((id) => !swipedIds.includes(id))
-
-  // Exclude blocked users (bidirectional)
-  const blockedRelations = await prisma.userBlock.findMany({
-    where: {
-      OR: [
-        { blockerId: myUserId, blockedId: { in: visibleUserIds } },
-        { blockerId: { in: visibleUserIds }, blockedId: myUserId },
-      ],
-    },
-    select: { blockerId: true, blockedId: true },
-  })
-  const blockedIds = new Set<string>()
-  for (const b of blockedRelations) {
-    blockedIds.add(b.blockerId === myUserId ? b.blockedId : b.blockerId)
-  }
-  const unblockedUserIds = visibleUserIds.filter((id) => !blockedIds.has(id))
-
-  if (unblockedUserIds.length === 0) return []
-
-  const [profiles, users, myProfile] = await Promise.all([
-    prisma.profile.findMany({
-      where: { userId: { in: unblockedUserIds } },
-      select: {
-        id: true,
-        userId: true,
-        name: true,
-        bio: true,
-        photos: true,
-        gender: true,
-        birthDate: true,
-        location: true,
-        interests: true,
-        lookingFor: true,
-        job: true,
-        verifiedAt: true,
-        boostedUntil: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    }),
-    prisma.user.findMany({
-      where: { id: { in: unblockedUserIds } },
-      select: { id: true, name: true, image: true, email: true, disabledAt: true, lastActiveDate: true },
-    }),
+  offset: number
+  limit: number
+}): Promise<SwipeDeckPage> {
+  const [myProfile, flaggedIds] = await Promise.all([
     prisma.profile.findUnique({
       where: { userId: myUserId },
       select: { lookingFor: true, interests: true, prefAgeMin: true, prefAgeMax: true, prefShowMe: true },
     }),
+    getFlaggedUserIds(),
   ])
 
-  const myLookingFor = myProfile?.lookingFor ?? []
-  const myInterests = myProfile?.interests ?? []
-  const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
-
-  // Optional intent filter
-  let intentFilteredUserIds = unblockedUserIds
-  if (intent) {
-    intentFilteredUserIds = unblockedUserIds.filter((id) => {
-      const p = profileByUserId.get(id)
-      return p?.lookingFor?.includes(intent)
-    })
-    if (intentFilteredUserIds.length === 0) return []
-  }
-
-  // Age / gender preference filters — only exclude a candidate when we can
-  // actually tell they don't match (missing data is never held against them).
   const prefAgeMin = myProfile?.prefAgeMin ?? 18
   const prefAgeMax = myProfile?.prefAgeMax ?? 99
   const prefShowMe = myProfile?.prefShowMe ?? 'Everyone'
-  const prefFilteredUserIds = intentFilteredUserIds.filter((id) => {
-    const p = profileByUserId.get(id)
-    const age = calculateAge(p?.birthDate)
-    if (age !== null && (age < prefAgeMin || age > prefAgeMax)) return false
-    if (prefShowMe !== 'Everyone' && p?.gender) {
-      const wantsGender = prefShowMe === 'Women' ? 'Female' : 'Male'
-      if (p.gender !== wantsGender) return false
-    }
-    return true
+  const myLookingFor = myProfile?.lookingFor ?? []
+  const myInterests = new Set(myProfile?.interests ?? [])
+
+  // AND-composed so the caller's `candidateWhere` (which may carry its own
+  // `user` and `OR` clauses) can't be clobbered by the filters below.
+  const where: Prisma.ProfileWhereInput = {
+    AND: [
+      candidateWhere,
+      {
+        userId: {
+          not: myUserId,
+          ...(flaggedIds.size > 0 ? { notIn: [...flaggedIds] } : {}),
+        },
+        user: {
+          disabledAt: null,
+          // Already swiped on, in this deck's scope.
+          swipesReceived: { none: { swiperId: myUserId, eventId: swipeHistoryEventId } },
+          // Candidate blocked me.
+          blockedUsers: { none: { blockedId: myUserId } },
+          // I blocked the candidate.
+          blockingUsers: { none: { blockerId: myUserId } },
+        },
+      },
+      ...(intent ? [{ lookingFor: { has: intent } }] : []),
+      // Missing gender is never held against a candidate, matching the previous
+      // behaviour — only exclude when we can positively tell they don't match.
+      ...(prefShowMe !== 'Everyone'
+        ? [
+            {
+              OR: [
+                { gender: null },
+                { gender: '' },
+                { gender: prefShowMe === 'Women' ? 'Female' : 'Male' },
+              ],
+            },
+          ]
+        : []),
+    ],
+  }
+
+  // Fetch exactly one page worth. The page IS this window: everything in it
+  // that survives the age filter is returned, and nextOffset advances by the
+  // window size, so no candidate is ever skipped.
+  //
+  // Over-fetching and slicing to `limit` was wrong — nextOffset advanced past
+  // rows that had been fetched but never returned, hiding most of the pool.
+  const fetchSize = Math.min(limit, DECK_CANDIDATE_LIMIT)
+
+  const rows = await prisma.profile.findMany({
+    where,
+    select: DECK_PROFILE_SELECT,
+    // Boosted profiles first, then most recently active. Stable ordering is
+    // what makes offset paging safe.
+    orderBy: [
+      { boostedUntil: { sort: 'desc', nulls: 'last' } },
+      { updatedAt: 'desc' },
+      { id: 'asc' },
+    ],
+    skip: offset,
+    take: fetchSize + 1,
   })
 
-  const userById = new Map(users.map((u) => [u.id, u]))
-
-  // Filter out disabled accounts and shadow-banned users (auto-moderation)
-  const flaggedIds = await getFlaggedUserIds()
-  const activeUserIds = prefFilteredUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
+  const hasMore = rows.length > fetchSize
+  const candidates = hasMore ? rows.slice(0, -1) : rows
 
   const now = new Date()
 
-  // Separate boosted and non-boosted profiles
-  const boostedIds = activeUserIds.filter((id) => {
-    const p = profileByUserId.get(id)
-    return p?.boostedUntil ? p.boostedUntil > now : false
+  // Age filter — the one predicate that cannot move into SQL.
+  const eligible = candidates.filter((p) => {
+    const age = calculateAge(p.birthDate)
+    return age === null || (age >= prefAgeMin && age <= prefAgeMax)
   })
-  const nonBoostedIds = activeUserIds.filter((id) => !boostedIds.includes(id))
 
-  // Shuffle each group separately
-  const shuffledBoosted = seededShuffle(boostedIds, myUserId + '-boosted')
-  const shuffledNonBoosted = seededShuffle(nonBoostedIds, myUserId)
+  const boostedIds = new Set(
+    eligible.filter((p) => p.boostedUntil && p.boostedUntil > now).map((p) => p.userId),
+  )
 
-  // Give preference to profiles with overlapping intents within each group
-  const sortByIntentOverlap = (userIds: string[]) => {
-    return userIds.sort((a, b) => {
-      const aProfile = profileByUserId.get(a)
-      const bProfile = profileByUserId.get(b)
-      const aLooking = aProfile?.lookingFor ?? []
-      const bLooking = bProfile?.lookingFor ?? []
+  const boosted = eligible.filter((p) => boostedIds.has(p.userId))
+  const nonBoosted = eligible.filter((p) => !boostedIds.has(p.userId))
 
-      const aOverlap =
-        myLookingFor.length > 0 && aLooking.length > 0
-          ? aLooking.filter((x) => myLookingFor.includes(x)).length
-          : 0
-      const bOverlap =
-        myLookingFor.length > 0 && bLooking.length > 0
-          ? bLooking.filter((x) => myLookingFor.includes(x)).length
-          : 0
+  // Vary the order between users and between pages, but keep it deterministic
+  // so a refetch of the same page returns the same order.
+  const seed = `${myUserId}:${offset}`
+  const overlapScore = (lookingFor: string[]) =>
+    myLookingFor.length === 0 ? 0 : lookingFor.filter((x) => myLookingFor.includes(x)).length
 
-      return bOverlap - aOverlap
-    })
+  const rank = (group: typeof eligible) =>
+    seededShuffle(group, seed)
+      // Stable sort keeps the shuffle intact within equal-overlap groups.
+      .sort((a, b) => overlapScore(b.lookingFor) - overlapScore(a.lookingFor))
+
+  // No slice: every eligible candidate in this window is returned. A page can
+  // come back shorter than `limit` when the age filter removes people, which
+  // is correct — the client keeps paging until nextOffset is null.
+  const ordered = [...rank(boosted), ...rank(nonBoosted)]
+
+  const items: DeckProfile[] = ordered.map(({ user, ...profile }) => ({
+    ...profile,
+    name: profile.name || user?.name || user?.email?.split('@')[0] || 'Unnamed',
+    photos:
+      profile.photos && profile.photos.length > 0
+        ? profile.photos
+        : user?.image
+          ? [user.image]
+          : [],
+    isBoosted: boostedIds.has(profile.userId),
+    sharedInterests: (profile.interests ?? []).filter((i) => myInterests.has(i)),
+    lastActiveDate: user?.lastActiveDate ?? null,
+  }))
+
+  return {
+    items,
+    // Advance by rows consumed from the DB window, never more.
+    nextOffset: hasMore ? offset + candidates.length : null,
   }
-
-  const sortedBoosted = sortByIntentOverlap(shuffledBoosted)
-  const sortedNonBoosted = sortByIntentOverlap(shuffledNonBoosted)
-  const finalUserIds = [...sortedBoosted, ...sortedNonBoosted]
-
-  return finalUserIds.map((userId) => {
-    const profile = profileByUserId.get(userId)
-    const user = userById.get(userId)
-    const isBoosted = !!profile?.boostedUntil && profile.boostedUntil > now
-    const sharedInterests = (profile?.interests ?? []).filter((i) => myInterests.includes(i))
-    if (profile) {
-      return {
-        ...profile,
-        name: profile.name || user?.name || 'Unnamed',
-        photos:
-          profile.photos && profile.photos.length > 0
-            ? profile.photos
-            : user?.image
-              ? [user.image]
-              : [],
-        isBoosted,
-        sharedInterests,
-        lastActiveDate: user?.lastActiveDate ?? null,
-      }
-    }
-    return {
-      id: user?.id ?? userId,
-      userId,
-      name: user?.name || user?.email?.split('@')[0] || 'Unnamed',
-      bio: '',
-      photos: user?.image ? [user.image] : [],
-      gender: '',
-      birthDate: '',
-      location: '',
-      interests: [],
-      lookingFor: [],
-      job: '',
-      verifiedAt: null,
-      boostedUntil: null,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      isBoosted: false,
-      sharedInterests: [] as string[],
-      lastActiveDate: user?.lastActiveDate ?? null,
-    }
-  })
 }
 
+const deckInput = z.object({
+  intent: z.enum(['dating', 'friends', 'networking']).optional(),
+  offset: z.number().int().min(0).max(10_000).default(0),
+  limit: z.number().int().min(1).max(50).default(DECK_PAGE_SIZE),
+})
+
 export const getEventProfiles = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({
-    eventId: z.string(),
-    intent: z.enum(['dating', 'friends', 'networking']).optional(),
-  }))
-  .handler(async ({ data: { eventId, intent } }) => {
+  .inputValidator(deckInput.extend({ eventId: z.string() }))
+  .handler(async ({ data: { eventId, intent, offset, limit } }) => {
     const session = await requireSession()
     const myUserId = session.user.id
 
-    await promoteWaitlist(eventId)
+    await maybePromoteWaitlist(eventId)
 
-    const attendees = await prisma.eventAttendee.findMany({
-      where: { eventId, leftAt: null },
-      select: { userId: true },
+    return buildSwipeDeck({
+      myUserId,
+      // Only attendees who've opted into event-scoped discovery show up here —
+      // global-mode attendees are only discoverable in the global pool.
+      candidateWhere: {
+        discoveryMode: 'event',
+        user: { attendances: { some: { eventId, leftAt: null } } },
+      },
+      swipeHistoryEventId: eventId,
+      intent,
+      offset,
+      limit,
     })
-    const attendeeIds = attendees.map((a) => a.userId).filter((id) => id !== myUserId)
-
-    if (attendeeIds.length === 0) return []
-
-    // Only attendees who've opted into event-scoped discovery show up here —
-    // global-mode attendees are only discoverable in the global pool.
-    const eventModeProfiles = await prisma.profile.findMany({
-      where: { userId: { in: attendeeIds }, discoveryMode: 'event' },
-      select: { userId: true },
-    })
-    const candidateUserIds = eventModeProfiles.map((p) => p.userId)
-
-    return buildSwipeDeck({ myUserId, candidateUserIds, swipeHistoryEventId: eventId, intent })
   })
 
 export const getGlobalProfiles = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({
-    intent: z.enum(['dating', 'friends', 'networking']).optional(),
-  }).optional())
+  .inputValidator(deckInput.optional())
   .handler(async ({ data }) => {
     const session = await requireSession()
-    const myUserId = session.user.id
 
-    const globalProfiles = await prisma.profile.findMany({
-      where: { discoveryMode: 'global', userId: { not: myUserId } },
-      select: { userId: true },
+    return buildSwipeDeck({
+      myUserId: session.user.id,
+      candidateWhere: { discoveryMode: 'global' },
+      swipeHistoryEventId: null,
+      intent: data?.intent,
+      offset: data?.offset ?? 0,
+      limit: data?.limit ?? DECK_PAGE_SIZE,
     })
-    const candidateUserIds = globalProfiles.map((p) => p.userId)
-
-    return buildSwipeDeck({ myUserId, candidateUserIds, swipeHistoryEventId: null, intent: data?.intent })
   })
 
 export const getEventAttendees = createServerFn({ method: 'GET' })
@@ -785,7 +953,7 @@ export const getEventAttendees = createServerFn({ method: 'GET' })
     const session = await requireSession()
     const myUserId = session.user.id
 
-    await promoteWaitlist(eventId)
+    await maybePromoteWaitlist(eventId)
 
     const rows = await prisma.eventAttendee.findMany({
       where: { eventId, leftAt: null },
@@ -824,13 +992,25 @@ export const getEventAttendees = createServerFn({ method: 'GET' })
     const userById = new Map(users.map((u) => [u.id, u]))
     const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
 
-    // Filter out disabled accounts and shadow-banned users (auto-moderation)
+    // Filter out disabled accounts and shadow-banned users (auto-moderation).
+    // getFlaggedUserIds returns a Set — the old `.includes()` inside `.filter()`
+    // was a linear scan per candidate.
     const flaggedIds = await getFlaggedUserIds()
-    const activeUserIds = unblockedUserIds.filter((id) => !userById.get(id)?.disabledAt && !flaggedIds.includes(id))
+    const activeUserIds = unblockedUserIds.filter(
+      (id) => !userById.get(id)?.disabledAt && !flaggedIds.has(id),
+    )
 
     return activeUserIds.map((userId): Profile => {
       const profile = profileByUserId.get(userId)
-      if (profile) return profile
+      if (profile) {
+        // Verification captures are review material — never ship them to peers.
+        return {
+          ...profile,
+          verificationPhoto: null,
+          verificationSubmittedAt: null,
+          verificationStatus: null,
+        }
+      }
       const user = userById.get(userId)
       return {
         id: user?.id ?? userId,
@@ -845,6 +1025,9 @@ export const getEventAttendees = createServerFn({ method: 'GET' })
         lookingFor: [],
         job: '',
         verifiedAt: null,
+        verificationPhoto: null,
+        verificationSubmittedAt: null,
+        verificationStatus: null,
         boostedUntil: null,
         lastBoostedAt: null,
         discoveryMode: 'global',
@@ -866,8 +1049,8 @@ export const removeEventAttendee = createServerFn({ method: 'POST' })
     if (!event) throw new Error('Event not found')
     if (event.createdById !== session.user.id) throw new Error('Unauthorized')
 
-    await prisma.eventAttendee.update({
-      where: { eventId_userId: { eventId: data.eventId, userId: data.userId } },
+    await prisma.eventAttendee.updateMany({
+      where: { eventId: data.eventId, userId: data.userId, leftAt: null },
       data: { leftAt: new Date(), removedById: session.user.id, removedAt: new Date() },
     })
 
@@ -971,7 +1154,7 @@ export const getMyWaitlistedEvents = createServerFn({ method: 'GET' })
     })
 
     // Promote waitlists in case any events have started
-    await Promise.all(rows.map((r) => promoteWaitlist(r.eventId)))
+    await Promise.all(rows.map((r) => maybePromoteWaitlist(r.eventId)))
 
     // Re-fetch after promotion so we only return events where user is still waitlisted
     const refreshed = await prisma.eventWaitlist.findMany({
@@ -1005,7 +1188,7 @@ export const getEventWaitlist = createServerFn({ method: 'GET' })
       throw new Error('Unauthorized')
     }
 
-    await promoteWaitlist(eventId)
+    await maybePromoteWaitlist(eventId)
 
     const rows = await prisma.eventWaitlist.findMany({
       where: { eventId },
@@ -1027,12 +1210,15 @@ export const getEventWaitlist = createServerFn({ method: 'GET' })
     const userById = new Map(users.map((u) => [u.id, u]))
     const profileByUserId = new Map(profiles.map((p) => [p.userId, p]))
 
+    // Map lookup instead of rows.find() inside the map — that was a linear
+    // scan per entry.
+    const rowByUserId = new Map(rows.map((r) => [r.userId, r]))
     const activeUserIds = userIds.filter((id) => !userById.get(id)?.disabledAt)
 
     return activeUserIds.map((userId) => {
       const profile = profileByUserId.get(userId)
       const user = userById.get(userId)
-      const row = rows.find((r) => r.userId === userId)!
+      const row = rowByUserId.get(userId)!
       return {
         userId,
         joinedAt: row.joinedAt,
@@ -1069,37 +1255,110 @@ export const reportUser = createServerFn({ method: 'POST' })
   }))
   .handler(async ({ data }) => {
     const session = await requireSession()
+    const reporterId = session.user.id
+
+    if (reporterId === data.reportedId) {
+      return { success: false as const, message: 'You cannot report yourself' }
+    }
+
+    const throttle = await reportRateLimit(`report:${reporterId}`)
+    if (!throttle.success) {
+      return { success: false as const, message: 'You have filed too many reports recently.' }
+    }
 
     if (data.eventId) {
       const eventId = data.eventId
       // Both users should be attending the event
       const [reporterAttendee, reportedAttendee] = await Promise.all([
         prisma.eventAttendee.findFirst({
-          where: { eventId, userId: session.user.id, leftAt: null },
+          where: { eventId, userId: reporterId, leftAt: null },
+          select: { id: true },
         }),
         prisma.eventAttendee.findFirst({
           where: { eventId, userId: data.reportedId, leftAt: null },
+          select: { id: true },
         }),
       ])
 
       if (!reporterAttendee) {
-        return { success: false, message: 'You must be attending the event to report someone' }
+        return { success: false as const, message: 'You must be attending the event to report someone' }
       }
       if (!reportedAttendee) {
-        return { success: false, message: 'Reported user is not attending this event' }
+        return { success: false as const, message: 'Reported user is not attending this event' }
+      }
+    } else {
+      // A global report requires that the two users have actually crossed
+      // paths. Without this, anyone could report anyone — and since reports
+      // feed auto-moderation, that was a way to hide arbitrary users.
+      const [sharedEvent, match, swipe] = await Promise.all([
+        prisma.eventAttendee.findFirst({
+          where: {
+            userId: reporterId,
+            event: { attendees: { some: { userId: data.reportedId } } },
+          },
+          select: { id: true },
+        }),
+        prisma.eventMatch.findFirst({
+          where: {
+            OR: [
+              { user1Id: reporterId, user2Id: data.reportedId },
+              { user1Id: data.reportedId, user2Id: reporterId },
+            ],
+          },
+          select: { id: true },
+        }),
+        prisma.eventSwipe.findFirst({
+          where: {
+            OR: [
+              { swiperId: reporterId, swipedId: data.reportedId },
+              { swiperId: data.reportedId, swipedId: reporterId },
+            ],
+          },
+          select: { id: true },
+        }),
+      ])
+
+      if (!sharedEvent && !match && !swipe) {
+        return { success: false as const, message: 'You can only report people you have encountered' }
       }
     }
 
-    await prisma.report.create({
-      data: {
-        eventId: data.eventId ?? null,
-        reporterId: session.user.id,
-        reportedId: data.reportedId,
-        reason: data.reason,
-      },
+    // Update in place rather than stacking rows: a repeat report from the same
+    // reporter must not inflate the count that auto-moderation reads. The
+    // unique indexes on (reporterId, reportedId, eventId) — plus the partial
+    // one for global reports — backstop the race between the read and write
+    // below. Prisma's compound-unique upsert can't express a NULL eventId, so
+    // this is find-then-write with a P2002 catch.
+    const eventId = data.eventId ?? null
+    const reason = sanitizeText(data.reason)
+
+    const existing = await prisma.report.findFirst({
+      where: { reporterId, reportedId: data.reportedId, eventId },
+      select: { id: true },
     })
 
-    return { success: true }
+    if (existing) {
+      await prisma.report.update({
+        where: { id: existing.id },
+        data: { reason, status: 'pending', createdAt: new Date() },
+      })
+    } else {
+      try {
+        await prisma.report.create({
+          data: { eventId, reporterId, reportedId: data.reportedId, reason },
+        })
+      } catch (err) {
+        // Lost the race with a concurrent identical report — that's the
+        // desired end state anyway.
+        if (
+          !(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')
+        ) {
+          throw err
+        }
+      }
+    }
+
+    return { success: true as const }
   })
 
 export const getEventReports = createServerFn({ method: 'GET' })
@@ -1164,7 +1423,9 @@ export const getEventPosts = createServerFn({ method: 'GET' })
 
     const posts = await prisma.eventPost.findMany({
       where: { eventId },
-      orderBy: { createdAt: 'desc' },
+      // id as a tiebreaker: cursor pagination on a non-unique ordering
+      // key can skip or repeat rows when timestamps collide.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor && { cursor: { id: cursor }, skip: 1 }),
     })
@@ -1214,17 +1475,23 @@ export const createEventPost = createServerFn({ method: 'POST' })
     const isCreator = event.createdById === session.user.id
     const isAttendee = await prisma.eventAttendee.findFirst({
       where: { eventId, userId: session.user.id, leftAt: null },
+      select: { id: true },
     })
 
     if (!isCreator && !isAttendee) {
       throw new Error('Unauthorized')
     }
 
+    const throttle = await eventPostRateLimit(`event-post:${session.user.id}`)
+    if (!throttle.success) {
+      throw new Error('You are posting too quickly. Please slow down.')
+    }
+
     const post = await prisma.eventPost.create({
       data: {
         eventId,
         userId: session.user.id,
-        content: content.trim(),
+        content: sanitizeText(content.trim()),
       },
     })
 

@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { useState, useRef, useCallback } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Skeleton } from '@heroui/react'
 import { X, Heart, MapPin, Users, ArrowRight, Flag, MessageCircle, Briefcase, Zap, RotateCcw, Sparkles } from 'lucide-react'
 import { getMyActiveEvent, reportUser } from '#/server/events'
@@ -58,11 +58,34 @@ function DiscoverPage() {
 
   const [selectedIntent, setSelectedIntent] = useState<'dating' | 'friends' | 'networking' | ''>('')
 
-  const { data: baseProfiles = [], isLoading: profilesLoading } = useQuery({
+  // The deck is paged now — the server used to return every candidate in the
+  // pool in one response.
+  const {
+    data: deckPages,
+    isLoading: profilesLoading,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
     queryKey: ['swipe-deck', effectiveEventId ?? 'global', selectedIntent],
-    queryFn: () => getSwipeDeck({ data: { eventId: effectiveEventId, intent: selectedIntent || undefined } }),
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) =>
+      getSwipeDeck({
+        data: {
+          eventId: effectiveEventId,
+          intent: selectedIntent || undefined,
+          offset: pageParam,
+          limit: 30,
+        },
+      }),
+    getNextPageParam: (lastPage) => lastPage.nextOffset ?? undefined,
     enabled: !profileLoading && !awaitingEventCheckIn,
   })
+
+  const baseProfiles = useMemo(
+    () => deckPages?.pages.flatMap((page) => page.items) ?? [],
+    [deckPages],
+  )
 
   const [currentIndex, setCurrentIndex] = useState(0)
   const [photoIndices, setPhotoIndices] = useState<Record<string, number>>({})
@@ -78,11 +101,26 @@ function DiscoverPage() {
   const [reportCustom, setReportCustom] = useState('')
   const [reportSuccess, setReportSuccess] = useState('')
 
+  const [swipeError, setSwipeError] = useState('')
+
   const swipeMutation = useMutation({
     mutationFn: recordSwipe,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['likes'] })
       queryClient.invalidateQueries({ queryKey: ['matches'] })
+    },
+    // The swipe was previously fire-and-forget: the card was marked swiped in
+    // local state and the deck scrolled on, so a rate-limit rejection or a
+    // dropped request silently lost the swipe. Roll the optimistic state back
+    // and say so.
+    onError: (error, vars) => {
+      setSwipedIds((prev) => {
+        const next = new Set(prev)
+        next.delete(vars.data.swipedId)
+        return next
+      })
+      setSwipeError((error as Error)?.message || 'Could not record that. Try again.')
+      setTimeout(() => setSwipeError(''), 3000)
     },
   })
 
@@ -186,12 +224,42 @@ function DiscoverPage() {
     setPhotoIndices((prev) => ({ ...prev, [profileId]: Math.max((prev[profileId] ?? 0) - 1, 0) }))
   }
 
+  // The scroll handler ran setCurrentIndex on every scroll event, re-rendering
+  // every mounted card each frame. Coalesce to one update per animation frame,
+  // and skip the state write entirely when the index hasn't changed.
+  const scrollFrameRef = useRef<number | null>(null)
+
   const onScroll = useCallback(() => {
-    const container = containerRef.current
-    if (!container) return
-    const idx = Math.round(container.scrollTop / container.clientHeight)
-    setCurrentIndex(Math.min(Math.max(idx, 0), baseProfiles.length - 1))
+    if (scrollFrameRef.current !== null) return
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null
+      const container = containerRef.current
+      if (!container || container.clientHeight === 0) return
+      const idx = Math.round(container.scrollTop / container.clientHeight)
+      const clamped = Math.min(Math.max(idx, 0), Math.max(baseProfiles.length - 1, 0))
+      setCurrentIndex((prev) => (prev === clamped ? prev : clamped))
+    })
   }, [baseProfiles.length])
+
+  useEffect(() => {
+    return () => {
+      if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current)
+    }
+  }, [])
+
+  // Pull the next page as the user approaches the end of the loaded deck.
+  useEffect(() => {
+    if (!hasNextPage || isFetchingNextPage) return
+    if (baseProfiles.length - currentIndex > 8) return
+    void fetchNextPage()
+  }, [currentIndex, baseProfiles.length, hasNextPage, isFetchingNextPage, fetchNextPage])
+
+  // Only mount cards near the viewport. Rendering the whole deck meant N
+  // full-screen sections, each with its own image, live at once.
+  const WINDOW_BEHIND = 1
+  const WINDOW_AHEAD = 3
+  const windowStart = Math.max(0, currentIndex - WINDOW_BEHIND)
+  const windowEnd = Math.min(baseProfiles.length, currentIndex + WINDOW_AHEAD + 1)
 
   if (awaitingEventCheckIn) {
     return (
@@ -266,10 +334,10 @@ function DiscoverPage() {
           ))}
         </div>
       </div>
-      {rewindError && (
+      {(rewindError || swipeError) && (
         <div className="shrink-0 px-4 pb-2">
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-center">
-            <p className="text-xs font-medium text-amber-800">{rewindError}</p>
+            <p className="text-xs font-medium text-amber-800">{rewindError || swipeError}</p>
           </div>
         </div>
       )}
@@ -280,11 +348,24 @@ function DiscoverPage() {
         style={{ scrollBehavior: 'smooth' }}
       >
         {baseProfiles.map((profile, index) => {
+          // Cards outside the window keep their slot (so scroll position and
+          // snap points stay correct) but render nothing.
+          if (index < windowStart || index >= windowEnd) {
+            return (
+              <section
+                key={profile.userId}
+                data-index={index}
+                aria-hidden="true"
+                className="relative h-full w-full shrink-0 snap-start snap-stop overflow-hidden bg-[var(--mag-surface)]"
+              />
+            )
+          }
+
           const photoIdx = photoIndices[profile.userId] ?? 0
           const pic = profile.photos[photoIdx] ?? ''
           const hasPhotos = profile.photos.length > 0
-          const lastActive = formatLastActive((profile as any).lastActiveDate)
-          const sharedInterests: string[] = (profile as any).sharedInterests ?? []
+          const lastActive = formatLastActive(profile.lastActiveDate)
+          const sharedInterests: string[] = profile.sharedInterests ?? []
           return (
             <section
               key={profile.userId}
@@ -295,6 +376,7 @@ function DiscoverPage() {
                 <AvatarImage
                   src={pic}
                   alt={profile.name ?? ''}
+                  priority={index === currentIndex}
                   imgClassName={isMystery ? 'blur-[20px] grayscale-[0.5] transition-all duration-1000' : ''}
                 />
               </div>
@@ -313,7 +395,7 @@ function DiscoverPage() {
                   </span>
                 </div>
               )}
-              {(profile as any).isBoosted && (
+              {profile.isBoosted && (
                 <div className="absolute top-4 left-4 z-10">
                   <span className="inline-flex items-center gap-1 rounded-full bg-[var(--mag-ink)]/90 px-2 py-0.5 text-[10px] font-bold text-white backdrop-blur-sm">
                     <Zap className="h-3 w-3" /> BOOSTED

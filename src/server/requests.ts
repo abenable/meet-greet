@@ -1,8 +1,14 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
+import type { EventMessageRequest } from '@prisma/client'
 import { prisma } from '#/db'
 import { requireSession } from '#/server/auth'
 import { createNotification } from './notifications.server'
+import { findOrCreateMatch } from './matches.server'
+import { rateLimit } from '#/lib/rate-limit'
+import { getUserScopedIdentifier } from '#/lib/rate-limit.server'
+
+const requestRateLimit = rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 30 })
 
 export const sendMessageRequest = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
@@ -18,14 +24,43 @@ export const sendMessageRequest = createServerFn({ method: 'POST' })
       throw new Error('Cannot request yourself')
     }
 
+    const throttle = await requestRateLimit(getUserScopedIdentifier(senderId))
+    if (!throttle.success) {
+      throw new Error('Too many message requests. Please slow down.')
+    }
+
+    // A block in either direction stops the request. This was missing, so a
+    // blocked user could keep sending requests — each one a push notification.
+    const [receiver, block] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: data.receiverId },
+        select: { id: true, disabledAt: true },
+      }),
+      prisma.userBlock.findFirst({
+        where: {
+          OR: [
+            { blockerId: senderId, blockedId: data.receiverId },
+            { blockerId: data.receiverId, blockedId: senderId },
+          ],
+        },
+        select: { id: true },
+      }),
+    ])
+
+    if (!receiver || receiver.disabledAt || block) {
+      throw new Error('This profile is no longer available')
+    }
+
     if (eventId) {
       // Verify both are active attendees
       const [senderAttendee, receiverAttendee] = await Promise.all([
         prisma.eventAttendee.findFirst({
           where: { eventId, userId: senderId, leftAt: null },
+          select: { id: true },
         }),
         prisma.eventAttendee.findFirst({
           where: { eventId, userId: data.receiverId, leftAt: null },
+          select: { id: true },
         }),
       ])
 
@@ -38,12 +73,24 @@ export const sendMessageRequest = createServerFn({ method: 'POST' })
     const [u1, u2] = [senderId, data.receiverId].sort()
     const existingMatch = await prisma.eventMatch.findFirst({
       where: { eventId, user1Id: u1, user2Id: u2 },
+      select: { id: true },
     })
     if (existingMatch) {
       throw new Error('You are already matched')
     }
 
-    // Check for existing request in either direction
+    // Genuinely check both directions — the comment here claimed to, but the
+    // query only looked at sender→receiver. Two people requesting each other
+    // produced two pending rows instead of a match.
+    const inbound = await prisma.eventMessageRequest.findFirst({
+      where: { eventId, senderId: data.receiverId, receiverId: senderId, status: 'pending' },
+    })
+    if (inbound) {
+      // They already asked us — treat this as an accept rather than a second
+      // outstanding request.
+      return acceptRequestInternal(inbound, senderId)
+    }
+
     const existing = await prisma.eventMessageRequest.findFirst({
       where: { eventId, senderId, receiverId: data.receiverId },
     })
@@ -77,6 +124,47 @@ export const sendMessageRequest = createServerFn({ method: 'POST' })
     return request
   })
 
+/**
+ * Shared by acceptMessageRequest and by sendMessageRequest when it discovers
+ * an inbound request from the same person.
+ */
+async function acceptRequestInternal(request: EventMessageRequest, accepterId: string) {
+  const updated = await prisma.eventMessageRequest.update({
+    where: { id: request.id },
+    data: { status: 'accepted', updatedAt: new Date() },
+  })
+
+  // findOrCreateMatch is race-safe: the partial unique indexes on EventMatch
+  // make a duplicate pair impossible, and a lost race becomes a read.
+  const { match, created } = await findOrCreateMatch(
+    request.eventId ?? null,
+    request.senderId,
+    request.receiverId,
+  )
+
+  if (created) {
+    const otherId = request.senderId === accepterId ? request.receiverId : request.senderId
+    await Promise.all([
+      createNotification({
+        userId: otherId,
+        type: 'request_accepted',
+        title: 'Request Accepted',
+        body: 'Your message request was accepted. Start chatting!',
+        link: `/chats/match_${match.id}`,
+      }),
+      createNotification({
+        userId: accepterId,
+        type: 'match',
+        title: "It's a Match!",
+        body: 'You accepted a message request. Start chatting!',
+        link: `/chats/match_${match.id}`,
+      }),
+    ])
+  }
+
+  return updated
+}
+
 export const acceptMessageRequest = createServerFn({ method: 'POST' })
   .inputValidator(z.string()) // requestId
   .handler(async ({ data: requestId }) => {
@@ -89,45 +177,7 @@ export const acceptMessageRequest = createServerFn({ method: 'POST' })
     if (request.receiverId !== session.user.id) throw new Error('Not authorized')
     if (request.status !== 'pending') throw new Error('Request already handled')
 
-    const updated = await prisma.eventMessageRequest.update({
-      where: { id: requestId },
-      data: { status: 'accepted', updatedAt: new Date() },
-    })
-
-    // Create match
-    const [u1, u2] = [request.senderId, request.receiverId].sort()
-    const existingMatch = await prisma.eventMatch.findFirst({
-      where: { eventId: request.eventId ?? null, user1Id: u1, user2Id: u2 },
-    })
-
-    if (!existingMatch) {
-      const match = await prisma.eventMatch.create({
-        data: {
-          eventId: request.eventId,
-          user1Id: u1,
-          user2Id: u2,
-        },
-      })
-
-      await Promise.all([
-        createNotification({
-          userId: request.senderId,
-          type: 'request_accepted',
-          title: 'Request Accepted',
-          body: 'Your message request was accepted. Start chatting!',
-          link: `/chats/match_${match.id}`,
-        }),
-        createNotification({
-          userId: request.receiverId,
-          type: 'match',
-          title: "It's a Match!",
-          body: 'You accepted a message request. Start chatting!',
-          link: `/chats/match_${match.id}`,
-        }),
-      ])
-    }
-
-    return updated
+    return acceptRequestInternal(request, session.user.id)
   })
 
 export const declineMessageRequest = createServerFn({ method: 'POST' })
@@ -140,6 +190,10 @@ export const declineMessageRequest = createServerFn({ method: 'POST' })
 
     if (!request) throw new Error('Request not found')
     if (request.receiverId !== session.user.id) throw new Error('Not authorized')
+    // accept guarded on this and decline did not, so an accepted request could
+    // be flipped to declined after the match already existed — and declined
+    // requests are re-sendable, which made the whole cycle repeatable.
+    if (request.status !== 'pending') throw new Error('Request already handled')
 
     return prisma.eventMessageRequest.update({
       where: { id: requestId },

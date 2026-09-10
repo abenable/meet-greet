@@ -4,10 +4,10 @@ import { prisma } from '#/db'
 import { requireSession } from '#/server/auth'
 import { createNotification } from './notifications.server'
 import { rateLimit } from '#/lib/rate-limit'
-import { getClientIdentifier } from '#/lib/rate-limit.server'
-import { sanitizeText } from '#/lib/sanitize'
+import { getUserScopedIdentifier } from '#/lib/rate-limit.server'
 import { broadcastMatchCreated } from './websocket-broadcast'
 import { awardBadgeIfNotExists } from './badges.server'
+import { findOrCreateMatch } from './matches.server'
 import { getEventProfiles, getGlobalProfiles } from '#/server/events'
 
 const swipeRateLimit = rateLimit({ windowMs: 60 * 1000, maxRequests: 30 })
@@ -23,8 +23,7 @@ export const recordSwipe = createServerFn({ method: 'POST' })
     const swiperId = session.user.id
     const eventId = data.eventId ?? null
 
-    const identifier = `${getClientIdentifier()}:${swiperId}`
-    const rateLimitResult = await swipeRateLimit(identifier)
+    const rateLimitResult = await swipeRateLimit(getUserScopedIdentifier(swiperId))
 
     if (!rateLimitResult.success) {
       throw new Error('Too many swipes. Please slow down.')
@@ -34,13 +33,38 @@ export const recordSwipe = createServerFn({ method: 'POST' })
       throw new Error('Cannot swipe yourself')
     }
 
+    // A block in either direction stops the swipe outright. This used to be
+    // applied only when reading getLikes, so a blocked user could still like
+    // you — and each like fired a push notification.
+    const [target, block] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: data.swipedId },
+        select: { id: true, disabledAt: true },
+      }),
+      prisma.userBlock.findFirst({
+        where: {
+          OR: [
+            { blockerId: swiperId, blockedId: data.swipedId },
+            { blockerId: data.swipedId, blockedId: swiperId },
+          ],
+        },
+        select: { id: true },
+      }),
+    ])
+
+    if (!target || target.disabledAt || block) {
+      throw new Error('This profile is no longer available')
+    }
+
     if (eventId) {
       const [swiperAttendee, swipedAttendee] = await Promise.all([
         prisma.eventAttendee.findFirst({
           where: { eventId, userId: swiperId, leftAt: null },
+          select: { id: true },
         }),
         prisma.eventAttendee.findFirst({
           where: { eventId, userId: data.swipedId, leftAt: null },
+          select: { id: true },
         }),
       ])
 
@@ -82,27 +106,9 @@ export const recordSwipe = createServerFn({ method: 'POST' })
       ])
 
       if (mutual) {
-        const [u1, u2] = [swiperId, data.swipedId].sort()
-        const existingMatch = await prisma.eventMatch.findFirst({
-          where: { eventId, user1Id: u1, user2Id: u2 },
-        })
+        const { match, created } = await findOrCreateMatch(eventId, swiperId, data.swipedId)
 
-        if (!existingMatch) {
-          const event = eventId
-            ? await prisma.event.findUnique({
-                where: { id: eventId },
-                select: { mysteryMode: true },
-              })
-            : null
-          const match = await prisma.eventMatch.create({
-            data: {
-              eventId,
-              user1Id: u1,
-              user2Id: u2,
-              messagesUnlockedAt: event?.mysteryMode ? null : new Date(),
-            },
-          })
-
+        if (created) {
           // Broadcast WebSocket notification for instant match alert
           broadcastMatchCreated(eventId, swiperId, data.swipedId, match.id)
 
@@ -111,7 +117,7 @@ export const recordSwipe = createServerFn({ method: 'POST' })
             awardBadgeIfNotExists(swiperId, 'first_match'),
             awardBadgeIfNotExists(data.swipedId, 'first_match'),
           ])
-          
+
           // Notify both users about the match
           await Promise.all([
             createNotification({
@@ -129,9 +135,9 @@ export const recordSwipe = createServerFn({ method: 'POST' })
               link: `/chats/match_${match.id}`,
             }),
           ])
-          return match
         }
-        return existingMatch
+
+        return match
       }
 
       // Not mutual yet — notify the swiped user they got a like
@@ -348,72 +354,37 @@ export const getMatches = createServerFn({ method: 'GET' })
       })
   })
 
-export const getMessages = createServerFn({ method: 'GET' })
-  .inputValidator(z.string())
-  .handler(async ({ data: matchId }) => {
-    const session = await requireSession()
-
-    const match = await prisma.eventMatch.findFirst({
-      where: {
-        id: matchId,
-        OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
-      },
-    })
-    if (!match) return []
-
-    return prisma.eventMessage.findMany({
-      where: { matchId },
-      orderBy: { createdAt: 'asc' },
-    })
-  })
-
-export const sendMessage = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({
-    matchId: z.string(),
-    content: z.string().min(1).max(2000),
-  }))
-  .handler(async ({ data }) => {
-    const session = await requireSession()
-    const sanitizedContent = sanitizeText(data.content)
-
-    const match = await prisma.eventMatch.findFirst({
-      where: {
-        id: data.matchId,
-        OR: [{ user1Id: session.user.id }, { user2Id: session.user.id }],
-      },
-    })
-    if (!match) throw new Error('Match not found')
-
-    const peerId = match.user1Id === session.user.id ? match.user2Id : match.user1Id
-    await createNotification({
-      userId: peerId,
-      type: 'message',
-      title: 'New Message',
-      body: data.content.slice(0, 100),
-      link: `/chats/match_${data.matchId}`,
-    })
-
-    return prisma.eventMessage.create({
-      data: {
-        matchId: data.matchId,
-        senderId: session.user.id,
-        content: sanitizedContent,
-      },
-    })
-  })
+// getMessages / sendMessage used to live here as well. They were superseded by
+// the unified chat API in server/conversations.ts (getChatMessages /
+// sendChatMessage), which handles both match and organizer threads, enforces
+// blocks, and paginates. Two implementations of the same thing had already
+// drifted apart — this one sanitized but skipped the block check, the other
+// checked blocks but skipped sanitizing.
 
 export const getSwipeDeck = createServerFn({ method: 'GET' })
   .inputValidator(
     z.object({
       eventId: z.string().optional(),
       intent: z.enum(['dating', 'friends', 'networking']).optional(),
+      offset: z.number().int().min(0).max(10_000).default(0),
+      limit: z.number().int().min(1).max(50).default(30),
     })
   )
   .handler(async ({ data }) => {
     // getEventProfiles/getGlobalProfiles handle boost sorting internally: boosted
     // profiles appear first, each group is shuffled separately, then concatenated.
+    // Both return a page — { items, nextOffset } — rather than the whole pool.
     if (data.eventId) {
-      return getEventProfiles({ data: { eventId: data.eventId, intent: data.intent } })
+      return getEventProfiles({
+        data: {
+          eventId: data.eventId,
+          intent: data.intent,
+          offset: data.offset,
+          limit: data.limit,
+        },
+      })
     }
-    return getGlobalProfiles({ data: { intent: data.intent } })
+    return getGlobalProfiles({
+      data: { intent: data.intent, offset: data.offset, limit: data.limit },
+    })
   })

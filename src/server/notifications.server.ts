@@ -18,12 +18,14 @@ export async function createNotification(data: {
 }) {
   const notification = await prisma.notification.create({ data })
 
-  // Also send push notification to the user's devices
-  await sendPushNotification(data.userId, {
+  // Push delivery is one outbound HTTP request per subscribed device. Awaiting
+  // it put third-party network latency directly into the response time of
+  // sending a message, so it is dispatched without blocking the caller.
+  void sendPushNotification(data.userId, {
     title: data.title,
     body: data.body,
     url: data.link,
-  })
+  }).catch((err) => console.warn('[Push] delivery failed:', err))
 
   return notification
 }
@@ -47,6 +49,8 @@ export async function sendPushNotification(
 
   const pushPayload = JSON.stringify(payload)
 
+  const stale: string[] = []
+
   await Promise.all(
     subs.map(async (sub) => {
       try {
@@ -59,15 +63,22 @@ export async function sendPushNotification(
             },
           },
           pushPayload,
+          { TTL: 60 * 60 },
         )
       } catch (error: any) {
-        if (error.statusCode === 410 || error.statusCode === 404) {
-          // Subscription expired or invalid — remove it
-          await prisma.pushSubscription.delete({ where: { id: sub.id } })
+        if (error?.statusCode === 410 || error?.statusCode === 404) {
+          // Subscription expired or invalid — collect for one bulk delete.
+          stale.push(sub.id)
         } else {
           console.error('[Push] Failed to send notification:', error)
         }
       }
     }),
   )
+
+  if (stale.length > 0) {
+    await prisma.pushSubscription
+      .deleteMany({ where: { id: { in: stale } } })
+      .catch(() => {})
+  }
 }

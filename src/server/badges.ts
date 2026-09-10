@@ -9,27 +9,30 @@ function startOfDay(d: Date): Date {
   return result
 }
 
-export const checkAndUpdateStreak = createServerFn({ method: 'GET' })
+export const checkAndUpdateStreak = createServerFn({ method: 'POST' })
   .handler(async () => {
     const session = await requireSession()
     const user = await prisma.user.findUnique({
       where: { id: session.user.id },
-      select: { streakCount: true, lastActiveDate: true },
+      // lastStreakDate, not lastActiveDate: the presence heartbeat owns
+      // lastActiveDate and used to overwrite it with now() from an adjacent
+      // effect, which made this calculation see a zero-day delta and bail.
+      select: { streakCount: true, lastStreakDate: true },
     })
     if (!user) throw new Error('User not found')
 
     const now = new Date()
     const today = startOfDay(now)
-    const lastActive = user.lastActiveDate ? startOfDay(user.lastActiveDate) : null
+    const lastStreak = user.lastStreakDate ? startOfDay(user.lastStreakDate) : null
 
     let streakCount = user.streakCount
     let increased = false
 
-    if (!lastActive) {
+    if (!lastStreak) {
       streakCount = 1
       increased = true
     } else {
-      const diffMs = today.getTime() - lastActive.getTime()
+      const diffMs = today.getTime() - lastStreak.getTime()
       const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24))
       if (diffDays === 0) {
         return { streakCount, increased: false }
@@ -42,10 +45,17 @@ export const checkAndUpdateStreak = createServerFn({ method: 'GET' })
       }
     }
 
-    await prisma.user.update({
-      where: { id: session.user.id },
-      data: { streakCount, lastActiveDate: now },
+    // Guard on the value we just read so two tabs racing can't double-count.
+    const updated = await prisma.user.updateMany({
+      where: {
+        id: session.user.id,
+        lastStreakDate: user.lastStreakDate,
+      },
+      data: { streakCount, lastStreakDate: now },
     })
+    if (updated.count === 0) {
+      return { streakCount: user.streakCount, increased: false }
+    }
 
     if (streakCount === 3) {
       await awardBadgeIfNotExists(session.user.id, 'streak_3')
