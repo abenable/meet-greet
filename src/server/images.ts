@@ -6,46 +6,62 @@ import { requireSession } from '#/server/auth'
 import { prisma } from '#/db'
 
 const MAX_BASE64_LENGTH = 15_000_000 // ~10MB JPEG after encoding
+const DATA_URL_RE = /^data:image\/(jpeg|jpg|png|webp|gif);base64,/
+
+/**
+ * Resolve which R2 key prefixes the caller is allowed to write to or delete
+ * from. Users own their profile folder; event organizers own their event's
+ * folder. Anything else is rejected.
+ *
+ * This used to guard uploads only — deletes accepted any key in the bucket,
+ * which let any signed-in user erase another user's photos (their URLs are
+ * handed out by the swipe deck).
+ */
+async function assertCanWriteKey(userId: string, key: string) {
+  if (key.includes('..')) {
+    throw new Error('Invalid upload path')
+  }
+
+  if (key.startsWith(`profiles/${userId}/`)) return
+
+  const eventMatch = key.match(/^events\/([^/]+)\//)
+  if (eventMatch) {
+    const eventId = eventMatch[1]!
+    const event = await prisma.event.findUnique({
+      where: { id: eventId },
+      select: { createdById: true },
+    })
+    if (!event || event.createdById !== userId) {
+      throw new Error('Unauthorized')
+    }
+    return
+  }
+
+  throw new Error('Invalid upload path')
+}
 
 export const uploadImage = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
-    key: z.string().min(1),
+    key: z.string().min(1).max(512),
     imageBase64: z.string().min(1),
   }))
   .handler(async ({ data }) => {
     const { user } = await requireSession()
 
-    // Validate size
+    // Check the encoded length before decoding — Buffer.from would otherwise
+    // allocate the full payload before we could reject it.
     if (data.imageBase64.length > MAX_BASE64_LENGTH) {
       throw new Error('Image too large')
     }
 
-    // Validate data URL prefix
-    if (!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/.test(data.imageBase64)) {
+    if (!DATA_URL_RE.test(data.imageBase64)) {
       throw new Error('Invalid image format')
     }
 
     const base64Data = data.imageBase64.split(',')[1]
     if (!base64Data) throw new Error('Invalid image data')
 
-    // Validate key prefix: users can only write into their own profiles folder
-    // or into events they own
-    const profilePrefix = `profiles/${user.id}/`
-    const eventsPrefixMatch = data.key.match(`^events/([^/]+)/`)
-    if (data.key.startsWith(profilePrefix)) {
-      // OK
-    } else if (eventsPrefixMatch) {
-      const eventId = eventsPrefixMatch[1]!
-      const event = await prisma.event.findUnique({
-        where: { id: eventId },
-        select: { createdById: true },
-      })
-      if (!event || event.createdById !== user.id) {
-        throw new Error('Unauthorized')
-      }
-    } else {
-      throw new Error('Invalid upload path')
-    }
+    await assertCanWriteKey(user.id, data.key)
 
     const buffer = Buffer.from(base64Data, 'base64')
 
@@ -63,13 +79,18 @@ export const uploadImage = createServerFn({ method: 'POST' })
 
 export const deleteImage = createServerFn({ method: 'POST' })
   .inputValidator(z.object({
-    url: z.string(),
+    url: z.string().url().max(2048),
   }))
   .handler(async ({ data }) => {
-    await requireSession()
+    const { user } = await requireSession()
+
     const key = getR2KeyFromUrl(data.url)
-    if (key) {
-      await deleteR2Object(key)
-    }
-    return { success: true }
+    if (!key) return { success: false as const }
+
+    // Same ownership rule as upload: you can only delete out of your own
+    // profile folder or an event you created.
+    await assertCanWriteKey(user.id, key)
+
+    await deleteR2Object(key)
+    return { success: true as const }
   })

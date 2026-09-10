@@ -2,8 +2,7 @@ import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { prisma } from '#/db'
 import { requireAdmin } from '#/server/auth'
-import { r2Client, R2_BUCKET_NAME } from '#/lib/r2'
-import { DeleteObjectCommand } from '@aws-sdk/client-s3'
+import { createNotification } from './notifications.server'
 
 export const getAdminStats = createServerFn({ method: 'GET' })
   .handler(async () => {
@@ -24,7 +23,9 @@ export const getAdminStats = createServerFn({ method: 'GET' })
       prisma.eventMatch.count(),
       prisma.eventMessage.count(),
       prisma.report.count(),
-      prisma.report.count({ where: { createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } } }),
+      // Actually pending, not "created in the last week" — the old filter
+      // counted dismissed and reviewed reports and missed older open ones.
+      prisma.report.count({ where: { status: 'pending' } }),
     ])
 
     const recentUsers = await prisma.user.count({
@@ -81,7 +82,9 @@ export const getAllUsers = createServerFn({ method: 'GET' })
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      // id as a tiebreaker: cursor pagination on a non-unique ordering
+      // key can skip or repeat rows when timestamps collide.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor && { cursor: { id: cursor }, skip: 1 }),
     })
@@ -101,12 +104,31 @@ export const updateUserRole = createServerFn({ method: 'POST' })
     role: z.enum(['user', 'admin']),
   }))
   .handler(async ({ data }) => {
-    await requireAdmin()
+    const session = await requireAdmin()
+
+    if (data.role !== 'admin') {
+      // Don't let an admin demote themselves by accident, and never leave the
+      // instance with zero admins — both states can only be undone by direct
+      // database access.
+      if (data.userId === session.user.id) {
+        throw new Error('You cannot remove your own admin access')
+      }
+      const remainingAdmins = await prisma.user.count({
+        where: { role: 'admin', id: { not: data.userId }, disabledAt: null },
+      })
+      if (remainingAdmins === 0) {
+        throw new Error('Cannot remove the last remaining admin')
+      }
+    }
 
     await prisma.user.update({
       where: { id: data.userId },
       data: { role: data.role },
     })
+
+    console.info(
+      `[admin] ${session.user.id} set role="${data.role}" on user ${data.userId}`,
+    )
 
     return { success: true }
   })
@@ -173,7 +195,9 @@ export const getAllEvents = createServerFn({ method: 'GET' })
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      // id as a tiebreaker: cursor pagination on a non-unique ordering
+      // key can skip or repeat rows when timestamps collide.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor && { cursor: { id: cursor }, skip: 1 }),
     })
@@ -192,27 +216,19 @@ export const adminDeleteEvent = createServerFn({ method: 'POST' })
   .handler(async ({ data: eventId }) => {
     await requireAdmin()
 
-    // Find and delete orphaned voice files from R2 before cascading DB delete
-    const voiceMessages = await prisma.eventMessage.findMany({
-      where: {
-        match: { eventId },
-        type: 'voice',
-        audioUrl: { not: null },
-      },
-      select: { audioUrl: true },
-    })
-
-    for (const msg of voiceMessages) {
-      if (!msg.audioUrl) continue
-      try {
-        const key = msg.audioUrl.replace(`https://${R2_BUCKET_NAME}.r2.cloudflarestorage.com/`, '')
-          .replace(`${process.env.R2_PUBLIC_URL}/`, '')
-        await r2Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: key }))
-      } catch (err) {
-        console.warn('[R2 Cleanup] Failed to delete voice file:', err)
-      }
-    }
-
+    // Deliberately no R2 cleanup here. Since the global-discovery migration,
+    // EventMatch.eventId is ON DELETE SET NULL — matches and their messages
+    // outlive the event they were made at. The previous implementation deleted
+    // the audio for every match that had ever belonged to this event, which
+    // silently broke voice messages in conversations that were still active.
+    //
+    // Voice files therefore stay in R2, which is correct: the conversations
+    // that reference them are still live.
+    //
+    // Nothing in the app deletes a match today, so nothing orphans those
+    // objects. deleteVoiceFilesForMatches() in matches.server.ts exists for the
+    // paths that will orphan them — account deletion, or any future match
+    // cleanup — and has no caller yet.
     await prisma.event.delete({
       where: { id: eventId },
     })
@@ -251,7 +267,9 @@ export const getAllReports = createServerFn({ method: 'GET' })
 
     const reports = await prisma.report.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      // id as a tiebreaker: cursor pagination on a non-unique ordering
+      // key can skip or repeat rows when timestamps collide.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       ...(cursor && { cursor: { id: cursor }, skip: 1 }),
     })
@@ -438,6 +456,61 @@ export const reviewReport = createServerFn({ method: 'POST' })
       where: { id: data.reportId },
       data: { status: 'reviewed' },
     })
+
+    return { success: true }
+  })
+
+export const getPendingVerifications = createServerFn({ method: 'GET' })
+  .inputValidator(z.object({
+    limit: z.number().min(1).max(100).default(50),
+  }).optional())
+  .handler(async ({ data }) => {
+    await requireAdmin()
+
+    const profiles = await prisma.profile.findMany({
+      where: { verificationStatus: 'pending' },
+      orderBy: { verificationSubmittedAt: 'asc' },
+      take: data?.limit ?? 50,
+      select: {
+        userId: true,
+        name: true,
+        photos: true,
+        verificationPhoto: true,
+        verificationSubmittedAt: true,
+      },
+    })
+
+    return profiles
+  })
+
+/**
+ * The only place verifiedAt is ever written. Users submit through
+ * submitPhotoVerification(); the badge itself is an admin decision.
+ */
+export const reviewVerification = createServerFn({ method: 'POST' })
+  .inputValidator(z.object({
+    userId: z.string(),
+    approve: z.boolean(),
+  }))
+  .handler(async ({ data }) => {
+    await requireAdmin()
+
+    await prisma.profile.update({
+      where: { userId: data.userId },
+      data: data.approve
+        ? { verifiedAt: new Date(), verificationStatus: 'approved' }
+        : { verifiedAt: null, verificationStatus: 'rejected' },
+    })
+
+    await createNotification({
+      userId: data.userId,
+      type: 'request_accepted',
+      title: data.approve ? 'Profile verified' : 'Verification not approved',
+      body: data.approve
+        ? 'Your verified badge is now live on your profile.'
+        : 'We could not verify your photo. You can submit a new one from your profile.',
+      link: '/profile',
+    }).catch(() => {})
 
     return { success: true }
   })
