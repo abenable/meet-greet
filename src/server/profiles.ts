@@ -1,7 +1,7 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { prisma } from '#/db'
-import { requireSession } from '#/server/auth'
+import { requireSession, invalidateSessionsForUser } from '#/server/auth'
 import { sanitizeProfile } from '#/lib/sanitize'
 import { r2Client, R2_BUCKET_NAME, R2_PUBLIC_URL } from '#/lib/r2'
 import { PutObjectCommand } from '@aws-sdk/client-s3'
@@ -93,7 +93,7 @@ export const updateProfile = createServerFn({ method: 'POST' })
       throw new Error('Minimum age cannot be greater than maximum age')
     }
 
-    return prisma.profile.upsert({
+    const saved = await prisma.profile.upsert({
       where: { userId: session.user.id },
       update: {
         ...(sanitized.bio !== undefined && { bio: sanitized.bio }),
@@ -125,6 +125,14 @@ export const updateProfile = createServerFn({ method: 'POST' })
         prefShowMe: data.prefShowMe ?? 'Everyone',
       },
     })
+
+    // The session carries the first photo as the avatar, so a photo change has
+    // to drop the cached copy or the header keeps showing the old one. After
+    // the write, not before — otherwise a concurrent read re-caches the stale
+    // value in the gap.
+    if (data.photos !== undefined) invalidateSessionsForUser(session.user.id)
+
+    return saved
   })
 
 const MAX_BASE64_LENGTH = 15_000_000 // ~10MB JPEG after encoding

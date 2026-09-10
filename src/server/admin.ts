@@ -1,7 +1,7 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { prisma } from '#/db'
-import { requireAdmin } from '#/server/auth'
+import { invalidateSessionsForUser, requireAdmin } from '#/server/auth'
 import { createNotification } from './notifications.server'
 
 export const getAdminStats = createServerFn({ method: 'GET' })
@@ -126,6 +126,10 @@ export const updateUserRole = createServerFn({ method: 'POST' })
       data: { role: data.role },
     })
 
+    // role is carried on the cached session and requireAdmin() reads it, so a
+    // demotion that isn't flushed leaves the user an admin until the TTL runs out.
+    invalidateSessionsForUser(data.userId)
+
     console.info(
       `[admin] ${session.user.id} set role="${data.role}" on user ${data.userId}`,
     )
@@ -157,6 +161,11 @@ export const toggleUserDisabled = createServerFn({ method: 'POST' })
         data: { leftAt: new Date() },
       })
     }
+
+    // Last, so the rows are already gone — flushing before the deleteMany
+    // leaves a gap in which a concurrent request re-caches a session that is
+    // about to be revoked.
+    invalidateSessionsForUser(data.userId)
 
     return { success: true }
   })

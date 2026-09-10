@@ -3,6 +3,7 @@ import { betterAuth } from 'better-auth'
 import { prismaAdapter } from 'better-auth/adapters/prisma'
 import { prisma } from '#/db'
 import { tanstackStartCookies } from 'better-auth/tanstack-start'
+import { CLIENT_IP_HEADER } from '#/lib/client-ip'
 
 const baseURL = process.env.BETTER_AUTH_URL
 
@@ -51,6 +52,23 @@ export const auth = betterAuth({
     enabled: true,
     window: 60,
     max: 20,
+    customRules: {
+      // /get-session must be exempt. The limiter applies to *every* better-auth
+      // path, not just the mutating ones, and its bucket is keyed on
+      // (ip, path) — so this endpoint gets its own 20-per-60s ceiling. The app
+      // blows through that on normal use: the root beforeLoad reads the session
+      // on every navigation and all 71 requireSession() call sites do too, and
+      // each one arrives as its own HTTP request, so the per-request
+      // memoization in server/auth.ts cannot collapse them. Once the ceiling
+      // was hit better-auth answered 429, resolveSession() read a non-ok
+      // response as "no session", and the user was bounced to /login mid-click
+      // and re-prompted for an OTP they had already passed.
+      //
+      // Exempting it costs nothing: it reads a cookie against the Session table
+      // and creates no state, so there is no brute-force or enumeration surface
+      // to throttle. Sign-in and sign-up keep their own (stricter) buckets.
+      '/get-session': false,
+    },
   },
   session: {
     expiresIn: 60 * 60 * 24 * 30,
@@ -66,15 +84,17 @@ export const auth = betterAuth({
     // Bun's Request exposes no socket, so better-auth cannot find a client IP
     // on its own and silently skips its own rate limiting ("Rate limiting
     // skipped: could not determine client IP address"). server.prod.ts injects
-    // the peer address from server.requestIP() into this header, stripping any
-    // inbound value first, so it is not client-controllable.
+    // the resolved client address into this header, stripping any inbound value
+    // first, so it is not client-controllable.
     ipAddress: {
-      ipAddressHeaders: [
-        'x-mag-client-ip',
-        ...(process.env.TRUST_PROXY && process.env.TRUST_PROXY !== '0'
-          ? ['x-forwarded-for', 'x-real-ip']
-          : []),
-      ],
+      // Only ever this one header. It is set by server.prod.ts from the
+      // already-resolved client address (see lib/client-ip.ts), so listing
+      // x-forwarded-for alongside it would be strictly worse: better-auth reads
+      // the *left-most* entry of that header, which is the part the caller
+      // supplies, so a client could hand itself a fresh rate-limit bucket on
+      // every request. TRUST_PROXY is honoured when the header is computed, not
+      // here.
+      ipAddressHeaders: [CLIENT_IP_HEADER],
     },
     defaultCookieAttributes: {
       httpOnly: true,

@@ -50,9 +50,11 @@ function LoginPage() {
       // an arbitrary address — the old isEmailVerified endpoint took any email
       // with no session and doubled as an account-existence oracle. The server
       // enforces this too: requireSession() rejects unverified sessions, so
-      // this branch is UX, not security.
+      // this branch is UX, not security — which is why it diverts only when it
+      // positively knows the address is unconfirmed. Reading an empty session
+      // as "unverified" sent people who had already passed OTP back through it.
       const session = await getSessionFn()
-      if (!session?.user?.emailVerified) {
+      if (session?.user && !session.user.emailVerified) {
         await sendEmailVerificationOtpFn({ data: normalizedEmail })
         navigate({ to: '/signup/verify', search: { email: normalizedEmail, redirect } })
         return
