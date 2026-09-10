@@ -1,35 +1,29 @@
 import { createContext, useContext, type ReactNode } from 'react'
-import { useWebSocket, type WSMessage } from '#/hooks/useWebSocket'
+import { useWebSocketConnection, type WSMessage } from '#/hooks/useWebSocket'
 
 interface WebSocketContextValue {
   connected: boolean
   lastMessage: WSMessage | null
-  send: (message: any) => void
+  send: (message: unknown) => void
   subscribeToEvent: (eventId: string) => void
   unsubscribeFromEvent: (eventId: string) => void
   sendTyping: (chatId: string, isTyping: boolean) => void
+  addMessageListener: (listener: (message: WSMessage) => void) => () => void
   reconnect: () => void
   disconnect: () => void
 }
 
 const WebSocketContext = createContext<WebSocketContextValue | null>(null)
 
+/**
+ * The app's single WebSocket lives here. Components consume it via
+ * useWebSocketContext() or useChatWebSocket(); calling the connection hook
+ * directly would open a second socket per tab.
+ */
 export function WebSocketProvider({ children }: { children: ReactNode }) {
-  const ws = useWebSocket({
-    autoReconnect: true,
-    onConnect: () => {
-      console.log('WebSocket provider connected')
-    },
-    onDisconnect: () => {
-      console.log('WebSocket provider disconnected')
-    },
-  })
+  const ws = useWebSocketConnection({ autoReconnect: true })
 
-  return (
-    <WebSocketContext.Provider value={ws}>
-      {children}
-    </WebSocketContext.Provider>
-  )
+  return <WebSocketContext.Provider value={ws}>{children}</WebSocketContext.Provider>
 }
 
 export function useWebSocketContext() {
