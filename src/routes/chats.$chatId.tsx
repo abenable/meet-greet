@@ -1,5 +1,5 @@
 import { createFileRoute, useParams, useNavigate } from '@tanstack/react-router'
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Skeleton } from '@heroui/react'
 import { ArrowLeft, Send, Check, CheckCheck, Ban, Mic, Play, Pause, Square, X } from 'lucide-react'
@@ -25,7 +25,9 @@ function VoiceMessagePlayer({ url, isMine }: { url: string; isMine: boolean }) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
   useEffect(() => {
-    const audio = new Audio(url)
+    const audio = new Audio()
+    audio.preload = 'metadata'
+    audio.src = url
     audioRef.current = audio
     audio.onloadedmetadata = () => setDuration(audio.duration)
     audio.onended = () => setPlaying(false)
@@ -33,6 +35,7 @@ function VoiceMessagePlayer({ url, isMine }: { url: string; isMine: boolean }) {
     return () => {
       audio.pause()
       audio.src = ''
+      audioRef.current = null
     }
   }, [url])
 
@@ -57,7 +60,9 @@ function VoiceMessagePlayer({ url, isMine }: { url: string; isMine: boolean }) {
         {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
       </button>
       <span className="min-w-[3rem] text-xs font-medium">{playing ? formatDuration(currentTime) : formatDuration(duration)}</span>
-      <audio src={url} preload="metadata" className="hidden" />
+      {/* No second <audio> element here: it duplicated the download of every
+          voice clip, since playback runs entirely through the Audio object
+          created above. */}
     </div>
   )
 }
@@ -86,11 +91,57 @@ function UnifiedChatPage() {
   // Use WebSocket for real-time updates
   const { connected, sendTyping, typingUsers } = useChatWebSocket(chatId)
 
+  // The newest page. Older history is fetched on demand into `olderMessages`
+  // below — without that, paginating the server silently truncated every
+  // conversation to its most recent 50 messages with no way to scroll back.
   const { data: chatData, isLoading, error } = useQuery({
     queryKey: ['chat', chatId],
-    queryFn: () => getChatMessages({ data: chatId }),
-    refetchInterval: connected ? false : 5000, // Fallback to polling if WebSocket disconnected
+    queryFn: () => getChatMessages({ data: { chatId } }),
+    // Keep a slow poll even when the socket is up. Disabling it on `connected`
+    // meant a socket that connected but delivered nothing left the thread
+    // frozen with no fallback — which is exactly what happened while the
+    // server never subscribed anyone to their own user topic.
+    refetchInterval: connected ? 30000 : 5000,
+    refetchOnWindowFocus: true,
   })
+
+  type ChatMessage = NonNullable<typeof chatData>['messages'][number]
+  const [olderMessages, setOlderMessages] = useState<ChatMessage[]>([])
+  const [olderCursor, setOlderCursor] = useState<string | null>(null)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+
+  // Reset paged-in history when switching conversations.
+  useEffect(() => {
+    setOlderMessages([])
+    setOlderCursor(null)
+  }, [chatId])
+
+  const hasOlder = (olderCursor ?? chatData?.nextCursor ?? null) !== null
+
+  const loadOlder = async () => {
+    const cursor = olderCursor ?? chatData?.nextCursor ?? null
+    if (!cursor || loadingOlder) return
+    setLoadingOlder(true)
+    try {
+      const page = await getChatMessages({ data: { chatId, before: cursor } })
+      setOlderMessages((prev) => [...page.messages, ...prev])
+      setOlderCursor(page.nextCursor ?? null)
+    } catch {
+      // Leave the button available to retry.
+    } finally {
+      setLoadingOlder(false)
+    }
+  }
+
+  // Deduplicate in case a poll refetch overlaps a page already loaded.
+  const messages = useMemo(() => {
+    const seen = new Set<string>()
+    return [...olderMessages, ...(chatData?.messages ?? [])].filter((m) => {
+      if (seen.has(m.id)) return false
+      seen.add(m.id)
+      return true
+    })
+  }, [olderMessages, chatData?.messages])
 
   const peerId = chatData?.peerId ?? ''
 
@@ -197,11 +248,10 @@ function UnifiedChatPage() {
     try {
       await sendChatMessage({ data: { chatId, content: input.trim() } })
       setInput('')
-      // WebSocket will handle the update, but invalidate as fallback
-      if (!connected) {
-        qc.invalidateQueries({ queryKey: ['chat', chatId] })
-        qc.invalidateQueries({ queryKey: ['conversations'] })
-      }
+      // Always invalidate. Gating this on `connected` assumed the socket would
+      // deliver the echo, which is not something the client can verify.
+      qc.invalidateQueries({ queryKey: ['chat', chatId] })
+      qc.invalidateQueries({ queryKey: ['conversations'] })
     } catch (e: any) {
       setSendError(e?.message || 'Failed to send message.')
     } finally {
@@ -283,10 +333,8 @@ function UnifiedChatPage() {
       })
 
       cancelRecording()
-      if (!connected) {
-        qc.invalidateQueries({ queryKey: ['chat', chatId] })
-        qc.invalidateQueries({ queryKey: ['conversations'] })
-      }
+      qc.invalidateQueries({ queryKey: ['chat', chatId] })
+      qc.invalidateQueries({ queryKey: ['conversations'] })
     } catch (e: any) {
       setSendError(e?.message || 'Failed to send voice message.')
     } finally {
@@ -374,11 +422,22 @@ function UnifiedChatPage() {
               </div>
             ))}
           </div>
-        ) : chatData?.messages.length === 0 ? (
+        ) : messages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-sm text-[var(--mag-ink-muted)]">Start the conversation!</div>
         ) : (
           <>
-            {chatData?.messages.map((msg: any) => (
+            {hasOlder && (
+              <div className="mb-2 flex justify-center">
+                <button
+                  onClick={loadOlder}
+                  disabled={loadingOlder}
+                  className="rounded-full border border-[var(--mag-line)] bg-[var(--mag-card)] px-4 py-1.5 text-xs font-medium text-[var(--mag-ink-soft)] transition hover:bg-[var(--mag-surface)] disabled:opacity-50"
+                >
+                  {loadingOlder ? 'Loading…' : 'Load earlier messages'}
+                </button>
+              </div>
+            )}
+            {messages.map((msg: any) => (
               <div key={msg.id} className={`flex ${msg.isMine ? 'justify-end' : 'justify-start'}`}>
                 {msg.type === 'voice' && msg.audioUrl ? (
                   <div className="max-w-[75%]">
